@@ -11,6 +11,10 @@
 #include "zmq/radio_factory_zmq_impl.h"
 #endif // ENABLE_ZMQ
 
+#ifdef ENABLE_SOAPY
+#include "soapy/radio_soapy_impl.h"
+#endif // ENABLE_SOAPY
+
 #include "plugin_radio_factory.h"
 
 using namespace ocudu;
@@ -31,6 +35,9 @@ static const std::vector<radio_factory_entry> radio_factory_available_factories 
 #ifdef ENABLE_ZMQ
     {"zmq", []() { return std::make_unique<radio_factory_zmq_impl>(); }},
 #endif // ENABLE_ZMQ
+#ifdef ENABLE_SOAPY
+    {"soapy", []() { return std::make_unique<radio_factory_soapy_impl>(); }},
+#endif // ENABLE_SOAPY
 };
 
 void ocudu::print_available_radio_factories()

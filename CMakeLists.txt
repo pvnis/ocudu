@@ -62,6 +62,7 @@ option(ENABLE_RTSAN          "Enable clang real-time sanitizer"             OFF)
 option(ENABLE_GCOV           "Enable code coverage"                         OFF)
 option(ENABLE_BACKWARD       "Enable backward"                              ON)
 option(ENABLE_UHD            "Enable UHD"                                   ON)
+option(ENABLE_SOAPY          "Enable Soapy"                                 ON)
 option(ENABLE_ZEROMQ         "Enable ZeroMQ"                                ON)
 option(ENABLE_FFTW           "Enable FFTW"                                  ON)
 option(ENABLE_MKL            "Enable Intel MKL"                             ON)
@@ -469,6 +470,24 @@ if (ENABLE_UHD)
 else (ENABLE_UHD)
     unset(UHD_FOUND CACHE)
 endif (ENABLE_UHD)
+
+# SoapySDR
+if (ENABLE_SOAPY)
+    find_package(SoapySDR)
+    if (SoapySDR_FOUND)
+        include_directories(${SoapySDR_INCLUDE_DIRS})
+        link_directories(${SoapySDR_LIBRARY_DIRS})
+        sbom_add(
+            PACKAGE            "SoapySDR"
+            DOWNLOAD_LOCATION  "https://github.com/pothosware/SoapySDR"
+            SUPPLIER           "SoapySDR project"
+            LICENSE            "BSD-3-Clause"
+            VERSION            ${SoapySDR_VERSION}
+        )
+    endif (SoapySDR_FOUND)
+else (ENABLE_SOAPY)
+    unset(SoapySDR_FOUND CACHE)
+endif (ENABLE_SOAPY)
 
 # Yaml-cpp
 find_package(YAMLCPP REQUIRED)
