@@ -7,17 +7,59 @@
 #include "ocudu/ocudulog/ocudulog.h"
 #include <SoapySDR/Device.hpp>
 #include <SoapySDR/Formats.hpp>
+#include <SoapySDR/Logger.hpp>
 #include <SoapySDR/Types.hpp>
+#include <chrono>
+#include <cstdlib>
+#include <string_view>
+#include <mutex>
 #include <string>
 #include <vector>
-
+  
 namespace ocudu {
 
 /// Thin wrapper around SoapySDR::Device providing safe_execution semantics.
 class radio_soapy_device : public soapy_exception_handler
 {
 public:
-  radio_soapy_device() : logger(ocudulog::fetch_basic_logger("RF")) {}
+  radio_soapy_device() : logger(ocudulog::fetch_basic_logger("RF"))
+  {
+    static std::once_flag registered;
+    std::call_once(registered, []() {
+      SoapySDR::registerLogHandler([](const SoapySDRLogLevel level, const char* message) {
+        ocudulog::basic_logger& lg = ocudulog::fetch_basic_logger("RF");
+        switch (level) {
+          case SOAPY_SDR_FATAL:
+          case SOAPY_SDR_CRITICAL:
+          case SOAPY_SDR_ERROR:
+            lg.error("SoapySDR: {}", message);
+            break;
+          case SOAPY_SDR_WARNING:
+            lg.warning("SoapySDR: {}", message);
+            break;
+          case SOAPY_SDR_NOTICE:
+          case SOAPY_SDR_INFO:
+            lg.info("SoapySDR: {}", message);
+            break;
+          case SOAPY_SDR_DEBUG:
+          case SOAPY_SDR_TRACE:
+          default:
+            lg.debug("SoapySDR: {}", message);
+            break;
+        }
+      });
+    });
+
+    if (const char* env = std::getenv("OCUDU_SOAPY_TRACE")) {
+      trace_enabled = std::string_view(env) != "0";
+    }
+    if (const char* env = std::getenv("OCUDU_SOAPY_TRACE_US")) {
+      trace_slow_us = std::strtol(env, nullptr, 10);
+      if (trace_slow_us <= 0) {
+        trace_slow_us = 200;
+      }
+    }
+  }
 
   ~radio_soapy_device() { unmake(); }
 
@@ -93,13 +135,15 @@ public:
   }
 
   /// Acquire a zero-copy TX write buffer. Returns the handle, or -1 on error.
-  int acquire_write_buffer(SoapySDR::Stream* stream, void**& buffs, long timeout_us = 100000)
+  int acquire_write_buffer(SoapySDR::Stream* stream, void** buffs, long timeout_us = 1000)
   {
     size_t handle = 0;
     int    ret    = 0;
+    const auto t0 = std::chrono::steady_clock::now();
     safe_execution([this, stream, &buffs, &handle, timeout_us, &ret]() {
       ret = device->acquireWriteBuffer(stream, handle, buffs, timeout_us);
     });
+    log_trace("acquireWriteBuffer", std::chrono::steady_clock::now() - t0, ret, timeout_us);
     if (ret < 0) {
       return ret;
     }
@@ -112,23 +156,44 @@ public:
                              int               flags,
                              long long         time_ns)
   {
-    return safe_execution([this, stream, handle, num_elems, flags, time_ns]() mutable {
+    const auto t0 = std::chrono::steady_clock::now();
+    const bool ok = safe_execution([this, stream, handle, num_elems, flags, time_ns]() mutable {
       device->releaseWriteBuffer(stream, handle, num_elems, flags, time_ns);
     });
+    log_trace("releaseWriteBuffer", std::chrono::steady_clock::now() - t0, ok ? 0 : -1, 0);
+    return ok;
+  }
+
+  int write_stream(SoapySDR::Stream*        stream,
+                   const void* const*       buffs,
+                   size_t                   num_elems,
+                   int&                     flags,
+                   long long                time_ns,
+                   long                     timeout_us = 0)
+  {
+    int ret = 0;
+    const auto t0 = std::chrono::steady_clock::now();
+    safe_execution([this, stream, &buffs, num_elems, &flags, time_ns, timeout_us, &ret]() {
+      ret = device->writeStream(stream, buffs, num_elems, flags, time_ns, timeout_us);
+    });
+    log_trace("writeStream", std::chrono::steady_clock::now() - t0, ret, timeout_us);
+    return ret;
   }
 
   /// Acquire a zero-copy RX read buffer. Returns num_samples, or negative on error.
   int acquire_read_buffer(SoapySDR::Stream* stream,
                           size_t&           handle,
-                          const void**&     buffs,
+                          const void**      buffs,
                           int&              flags,
                           long long&        time_ns,
                           long              timeout_us = 200000)
   {
     int ret = 0;
+    const auto t0 = std::chrono::steady_clock::now();
     safe_execution([this, stream, &handle, &buffs, &flags, &time_ns, timeout_us, &ret]() {
       ret = device->acquireReadBuffer(stream, handle, buffs, flags, time_ns, timeout_us);
     });
+    log_trace("acquireReadBuffer", std::chrono::steady_clock::now() - t0, ret, timeout_us);
     return ret;
   }
 
@@ -145,19 +210,36 @@ public:
                          long              timeout_us = 1000)
   {
     int ret = 0;
+    const auto t0 = std::chrono::steady_clock::now();
     safe_execution([this, stream, &chan_mask, &flags, &time_ns, timeout_us, &ret]() {
       ret = device->readStreamStatus(stream, chan_mask, flags, time_ns, timeout_us);
     });
+    log_trace("readStreamStatus", std::chrono::steady_clock::now() - t0, ret, timeout_us);
     return ret;
   }
 
 private:
   SoapySDR::Device*       device = nullptr;
   ocudulog::basic_logger& logger;
+  bool                    trace_enabled = false;
+  long                    trace_slow_us = 200;
 
   static constexpr double to_MHz(double value_Hz)
   {
     return value_Hz * 1e-6;
+  }
+
+  template <typename Duration>
+  void log_trace(const char* op, Duration dt, int ret, long timeout_us)
+  {
+    if (!trace_enabled) {
+      return;
+    }
+    const long us = std::chrono::duration_cast<std::chrono::microseconds>(dt).count();
+    if (ret < 0 || ret == SOAPY_SDR_OVERFLOW || ret == SOAPY_SDR_UNDERFLOW || ret == SOAPY_SDR_TIME_ERROR ||
+        us >= trace_slow_us) {
+      logger.info("Soapy trace: {} ret={} dt={}us timeout={}us", op, ret, us, timeout_us);
+    }
   }
 };
 

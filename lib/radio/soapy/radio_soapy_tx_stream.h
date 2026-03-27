@@ -14,6 +14,7 @@
 #include "ocudu/support/executors/task_executor.h"
 #include "ocudu/support/synchronization/stop_event.h"
 #include <SoapySDR/Device.hpp>
+#include <chrono>
 
 namespace ocudu {
 
@@ -31,10 +32,14 @@ class radio_soapy_tx_stream : public baseband_gateway_transmitter, public soapy_
   bool                  discontinuous_tx;
   unsigned              power_ramping_nof_samples = 0;
   long long             last_tx_time_ns           = 0;
+  long                  write_timeout_us          = 200;
   /// Pre-zeroed power ramping buffer (CI16 samples per channel).
   baseband_gateway_buffer_dynamic power_ramping_buffer;
   radio_soapy_tx_stream_fsm       state_fsm;
   rt_stop_event_source            stop_control;
+  ocudulog::basic_logger&         logger;
+  bool                            tx_trace_enabled      = false;
+  long                            tx_trace_threshold_us = 100;
 
   void recv_async_msg();
   void run_recv_async_msg();

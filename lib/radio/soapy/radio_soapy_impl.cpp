@@ -2,8 +2,10 @@
 // SPDX-License-Identifier: BSD-3-Clause-Open-MPI
 
 #include "radio_soapy_impl.h"
+#include "ocudu/ocudulog/ocudulog.h"
 #include <SoapySDR/Device.hpp>
 #include <SoapySDR/Types.hpp>
+#include <SoapySDR/Logger.hpp>
 #include <fmt/format.h>
 
 using namespace ocudu;

@@ -5,6 +5,7 @@
 #include "ocudu/gateways/baseband/buffer/baseband_gateway_buffer_reader_view.h"
 #include "ocudu/ocuduvec/zero.h"
 #include <SoapySDR/Errors.hpp>
+#include <cstdlib>
 #include <cstring>
 
 using namespace ocudu;
@@ -31,10 +32,27 @@ radio_soapy_tx_stream::radio_soapy_tx_stream(radio_soapy_device&       device_,
   srate_hz(desc.srate_hz),
   nof_channels(desc.nof_channels),
   discontinuous_tx(desc.discontinuous_tx),
-  power_ramping_buffer(desc.nof_channels, 0)
+  power_ramping_buffer(desc.nof_channels, 0),
+  logger(ocudulog::fetch_basic_logger("RF"))
 {
   ocudu_assert(std::isnormal(srate_hz) && srate_hz > 0.0, "Invalid sampling rate {}.", srate_hz);
   ocudu_assert(stream != nullptr, "TX stream must not be null.");
+
+  if (const char* env = std::getenv("OCUDU_SOAPY_TX_TRACE")) {
+    tx_trace_enabled = std::string_view(env) != "0";
+  }
+  if (const char* env = std::getenv("OCUDU_SOAPY_TX_TRACE_US")) {
+    tx_trace_threshold_us = std::strtol(env, nullptr, 10);
+    if (tx_trace_threshold_us <= 0) {
+      tx_trace_threshold_us = 100;
+    }
+  }
+  if (const char* env = std::getenv("OCUDU_SOAPY_TX_WRITE_TIMEOUT_US")) {
+    write_timeout_us = std::strtol(env, nullptr, 10);
+    if (write_timeout_us < 0) {
+      write_timeout_us = 0;
+    }
+  }
 
   mtu = device.get_stream_mtu(stream);
 
@@ -103,6 +121,7 @@ void radio_soapy_tx_stream::run_recv_async_msg()
 void radio_soapy_tx_stream::transmit(const baseband_gateway_buffer_reader&        data,
                                       const baseband_gateway_transmitter_metadata& tx_md)
 {
+  const auto tx_start_tp = std::chrono::steady_clock::now();
   auto token = stop_control.get_token();
   if (OCUDU_UNLIKELY(token.is_stop_requested())) {
     return;
@@ -150,23 +169,21 @@ void radio_soapy_tx_stream::transmit(const baseband_gateway_buffer_reader&      
         unsigned nof_pad = std::min(power_ramping_nof_samples, tx_gap_samples - min_gap);
         if (nof_pad > 0) {
           long long pad_time_ns = time_ns - samples_to_ns(nof_pad, srate_hz);
-          unsigned  pad_sent    = 0;
-
-          // The ramping buffer holds zeros; send MTU-sized chunks via acquireWriteBuffer.
-          while (pad_sent < nof_pad) {
-            void**  wr_buffs = nullptr;
-            int     handle   = device.acquire_write_buffer(stream, wr_buffs);
-            if (handle < 0) {
-              break;
+          std::array<const void*, RADIO_MAX_NOF_CHANNELS> pad_buffs = {};
+          for (unsigned ch = 0; ch != nof_channels; ++ch) {
+            pad_buffs[ch] = power_ramping_buffer.get_reader()[ch].data();
+          }
+          int pad_flags = SOAPY_SDR_HAS_TIME;
+          const int ret = device.write_stream(stream, pad_buffs.data(), nof_pad, pad_flags, pad_time_ns, write_timeout_us);
+          if (ret != static_cast<int>(nof_pad)) {
+            if (ret == SOAPY_SDR_TIMEOUT) {
+              logger.warning("SoapySDR TX: power ramping writeStream timeout after {} us; expected {} samples.",
+                             write_timeout_us,
+                             nof_pad);
+            } else {
+              logger.warning("SoapySDR TX: power ramping writeStream failed ret={} expected={}.", ret, nof_pad);
             }
-            const unsigned chunk = static_cast<unsigned>(mtu);
-            for (unsigned ch = 0; ch != nof_channels; ++ch) {
-              std::memset(reinterpret_cast<int16_t*>(wr_buffs[ch]), 0, chunk * sizeof(int16_t) * 2);
-            }
-            int pad_flags = (pad_sent == 0) ? SOAPY_SDR_HAS_TIME : 0;
-            device.release_write_buffer(stream, static_cast<size_t>(handle), chunk, pad_flags, pad_time_ns);
-            pad_time_ns += samples_to_ns(chunk, srate_hz);
-            pad_sent    += chunk;
+            return;
           }
 
           // The actual burst is no longer the start-of-burst for SoapySDR
@@ -199,45 +216,72 @@ void radio_soapy_tx_stream::transmit(const baseband_gateway_buffer_reader&      
     return;
   }
 
-  // Send data in MTU-sized chunks using the zero-copy DMA path.
   unsigned sent_total = 0;
+  unsigned chunks     = 0;
   while (sent_total < data_nof_samples) {
-    void** wr_buffs = nullptr;
-    int    handle   = device.acquire_write_buffer(stream, wr_buffs);
-    if (handle < 0) {
-      fmt::println(stderr, "SoapySDR TX: acquireWriteBuffer failed for stream {}.", stream_id);
+    std::array<const void*, RADIO_MAX_NOF_CHANNELS> rd_buffs = {};
+    const unsigned remaining = data_nof_samples - sent_total;
+    for (unsigned ch = 0; ch != nof_channels; ++ch) {
+      rd_buffs[ch] = data[ch].subspan(data_start + sent_total, remaining).data();
+    }
+
+    int chunk_flags = 0;
+    if (sent_total == 0) {
+      chunk_flags |= (flags & SOAPY_SDR_HAS_TIME);
+    }
+    chunk_flags |= (flags & SOAPY_SDR_END_BURST);
+
+    const long long chunk_time_ns = time_ns + samples_to_ns(sent_total, srate_hz);
+    const int ret = device.write_stream(stream, rd_buffs.data(), remaining, chunk_flags, chunk_time_ns, write_timeout_us);
+    if (ret <= 0) {
+      if (ret == SOAPY_SDR_TIMEOUT) {
+        logger.warning("SoapySDR TX: writeStream timeout after {} us for stream {}.", write_timeout_us, stream_id);
+      } else {
+        logger.warning("SoapySDR TX: writeStream failed ret={} for stream {}.", ret, stream_id);
+      }
       return;
     }
 
-    const unsigned chunk = std::min(static_cast<unsigned>(mtu), data_nof_samples - sent_total);
-
-    // Copy channel data into the DMA buffer.
-    for (unsigned ch = 0; ch != nof_channels; ++ch) {
-      const ci16_t* src = data[ch].subspan(data_start + sent_total, chunk).data();
-      std::memcpy(wr_buffs[ch], src, chunk * sizeof(ci16_t));
-    }
-
-    // Build flags for this chunk.
-    int chunk_flags = 0;
-    if (sent_total == 0) {
-      chunk_flags = flags; // carries HAS_TIME (and maybe END_BURST for single-chunk burst)
-    }
-    if (sent_total + chunk >= data_nof_samples && is_eob) {
-      chunk_flags |= SOAPY_SDR_END_BURST;
-    }
-
-    const long long chunk_time_ns = time_ns + samples_to_ns(sent_total, srate_hz);
-    device.release_write_buffer(stream, static_cast<size_t>(handle), chunk, chunk_flags, chunk_time_ns);
-
-    sent_total += chunk;
+    sent_total += static_cast<unsigned>(ret);
+    ++chunks;
   }
 
   last_tx_time_ns = time_ns + samples_to_ns(sent_total, srate_hz);
+
+  if (tx_trace_enabled) {
+    const long dt_us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - tx_start_tp)
+                           .count();
+    if (dt_us >= tx_trace_threshold_us) {
+      long long hw_now_ns = 0;
+      long long lead_us   = 0;
+      bool      hw_ok     = false;
+      if (device.get_hardware_time(hw_now_ns)) {
+        lead_us = (time_ns - hw_now_ns) / 1000;
+        hw_ok   = true;
+      }
+      logger.info("Soapy TX trace: stream={} samples={} chunks={} flags=0x{:x} ts={} empty={} dt={}us hw_now_ns={} "
+                  "tx_time_ns={} lead_us={}",
+                  stream_id,
+                  data_nof_samples,
+                  chunks,
+                  flags,
+                  tx_md.ts,
+                  tx_md.is_empty,
+                  dt_us,
+                  hw_ok ? hw_now_ns : -1LL,
+                  time_ns,
+                  hw_ok ? lead_us : -1LL);
+    }
+  }
 }
 
 void radio_soapy_tx_stream::start()
 {
   stop_control.reset();
+  if (!device.activate_stream(stream)) {
+    logger.error("Error: failed to activate TX stream {}. {}", stream_id, device.get_error_message());
+    return;
+  }
   report_error_if_not(async_executor.defer([this, token = stop_control.get_token()]() { run_recv_async_msg(); }),
                       "Unable to start SoapySDR TX async task");
 }
@@ -254,10 +298,12 @@ void radio_soapy_tx_stream::stop()
                                 .timestamp  = std::nullopt});
 
     // Send a zero-length end-of-burst to flush.
-    void** wr_buffs = nullptr;
-    int    handle   = device.acquire_write_buffer(stream, wr_buffs, 1000);
-    if (handle >= 0) {
-      device.release_write_buffer(stream, static_cast<size_t>(handle), 0, SOAPY_SDR_END_BURST, 0);
-    }
+    std::array<const void*, RADIO_MAX_NOF_CHANNELS> dummy_buffs = {};
+    int flush_flags = SOAPY_SDR_END_BURST;
+    (void)device.write_stream(stream, dummy_buffs.data(), 0, flush_flags, 0, write_timeout_us);
+  }
+
+  if (!device.deactivate_stream(stream)) {
+    logger.error("Error: failed to deactivate TX stream {}. {}", stream_id, device.get_error_message());
   }
 }
