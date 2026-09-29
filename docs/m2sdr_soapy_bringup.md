@@ -5,8 +5,8 @@ OCUDU gNB running on a LiteX-M2SDR (AD9361, PCIe) through the SoapySDR radio dri
 qcore, gets a PDU session and reaches the internet. Speedtest from the phone: 43 Mbit/s down,
 18 Mbit/s up (20 MHz TDD n78, 1T1R, default 6D/1S/3U pattern; theoretical PHY peak ≈ 70/30).
 
-Everything below is on the `soapy` branch of OCUDU and the `main-port` branch of `~/m2sdr`
-(HEAD 8b0244b5). The operational log of the debugging session is in `build/captures/STATUS.md`
+Everything below is on the `soapy` branch of OCUDU and the `working-ue` branch of `~/m2sdr`
+(HEAD 8b0244b5, formerly `main-port`). The operational log of the debugging session is in `build/captures/STATUS.md`
 (untracked); this document is the durable summary.
 
 ## 1. Cell configuration
@@ -149,7 +149,7 @@ re-anchors on every write (5000–7000/min) until the gNB is restarted; and some
 the TX thread ~0.8 s behind hardware time, which makes every UL request late without any re-anchor.
 The guardian's lead / PUxCH-late health check restarts those. All three need the plugin fix (§4.3).
 
-## 4. What changed in m2sdr (`~/m2sdr`, branch `main-port`, by the m2sdr agent session)
+## 4. What changed in m2sdr (`~/m2sdr`, branch `working-ue`, by the m2sdr agent session)
 
 The installed plugin `/usr/local/lib/SoapySDR/modules0.8/libSoapyLiteXM2SDR.so` is from 8b0244b5
 (2026-09-28 19:48). The kernel module is insmod'd from `litex_m2sdr/software/kernel` (not DKMS —
@@ -193,16 +193,24 @@ rebuild and reload after a reboot). CPU governor must be `performance` (not pers
 
 ## 5. Core network
 
-qcore: `cd ~/qcore && sudo ./target/debug/qcore --mcc 001 --mnc 01 --local-ip 127.0.0.1 --no-dhcp`
-(UEs on 10.255.0.0/24 via `veth2`). In its default DHCP mode it bridged the UE onto the LAN as
-192.168.1.x through `veth0` and the LAN router had no return path. In `--no-dhcp` mode qcore installs
-`-s 10.255.0.0/24 -o eth0 -j MASQUERADE`, but this host's uplink is `wlp5s0`, so add
+Two working qcore modes (both verified 2026-09-29; the gNB re-establishes NGAP by itself after a qcore
+restart, the phone needs an airplane-mode toggle to re-register):
 
-    sudo iptables -t nat -A POSTROUTING -s 10.255.0.0/24 -o wlp5s0 -j MASQUERADE
+* **DHCP / LAN mode (preferred, UE gets a real LAN address):**
+  `cd ~/qcore && ./setup-routing wlp5s0` once after boot (it sets `ip_forward`, `proxy_arp` on the LAN
+  interface, `rp_filter` off, creates `qcoretun`/`qcore_br0`/veths; "File exists"/"already assigned"
+  messages on re-runs are harmless), then
+  `sudo ./target/debug/qcore --mcc 001 --mnc 01 --local-ip 127.0.0.1 --lan-interface-name wlp5s0`.
+  The phone gets 192.168.1.x from the LAN's DHCP server through qcore's relay and the host answers
+  ARP for it. Without `proxy_arp` the LAN router has no return path and only host↔UE traffic works —
+  that was the "no internet" symptom.
+* **Self-managed / NAT mode:** `... --no-dhcp` (UEs on 10.255.0.0/24 via `veth2`) plus
+  `sudo iptables -t nat -A POSTROUTING -s 10.255.0.0/24 -o wlp5s0 -j MASQUERADE` — qcore installs its
+  own MASQUERADE for `eth0`, which does not exist on this host.
 
-(not reboot-persistent). The gNB re-establishes NGAP by itself after a qcore restart; the phone
-needs an airplane-mode toggle to re-register. SIM keys are in `~/qcore/sims.toml` (corrected by the
-user on 2026-09-29; the defaults were wrong).
+Neither the sysctls nor the iptables rule survive a reboot. SIM keys are in `~/qcore/sims.toml`
+(corrected by the user on 2026-09-29; the defaults were wrong). The phone also requests an `ims` DNN,
+which qcore declines with a 5GMM Status — harmless.
 
 ## 6. Things that made it worse (do not repeat)
 
@@ -219,7 +227,7 @@ user on 2026-09-29; the defaults were wrong).
 
 1. Load the M2SDR kernel module, set the CPU governor to `performance`, check
    `SoapySDRUtil --find` sees the board.
-2. Start qcore (§5) and add the NAT rule.
+2. Start qcore (§5): `./setup-routing wlp5s0` then qcore in DHCP mode.
 3. `cd build && bash captures/guardian.sh` (or the copy in `scripts/m2sdr/` after fixing the paths)
    — it starts the gNB, aligns it and keeps it healthy; log in `build/captures/guardian.log`.
 4. Phone: NR-SA only (`adb shell cmd phone set-allowed-network-types-for-users -s 0
