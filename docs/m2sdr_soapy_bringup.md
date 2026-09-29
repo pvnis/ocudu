@@ -149,6 +149,54 @@ re-anchors on every write (5000–7000/min) until the gNB is restarted; and some
 the TX thread ~0.8 s behind hardware time, which makes every UL request late without any re-anchor.
 The guardian's lead / PUxCH-late health check restarts those. All three need the plugin fix (§4.3).
 
+### 3.6 Why this radio needs the work-around and a USRP does not
+
+OCUDU's lower PHY makes two assumptions about the radio, both of which UHD/USRP (and LimeSDR,
+bladeRF in metadata mode) satisfy by construction and which the M2SDR plugin on this branch only
+approximates in software:
+
+1. **A sample stamped T is on the air at T** (up to a fixed, device-specific group delay, which is
+   what the small constant `ru_sdr.time_alignment_calibration` in the stock configs corrects and
+   which never changes between runs).
+2. **TX and RX are stamped by the same clock**, so "UL slot n arrives at RX time = TX time of slot n
+   − N_TA_offset" holds to the sample and the timing-advance loop only has to remove propagation
+   delay.
+
+*Hardware-timed radios.* Every TX packet carries a timestamp in its header; the FPGA holds the samples
+until its tick counter reaches that time and emits them on exactly that sample. RX packets are
+stamped by the same counter as captured. Lateness is handled without moving anything: a packet that
+arrives after its time is dropped and reported as an async late/underflow event, and the next
+on-time packet is emitted exactly when stamped. A host hiccup costs one slot of DL, never the
+alignment.
+
+*The M2SDR plugin (branch `working-ue`).* The gateware's TX DMA reader streams a free-running
+256 × 2048-sample ring (LOOP mode) with no timestamp compare in hardware. The plugin emulates timing:
+it observes "the hardware has consumed N buffers at board time T" once (or again after an underflow)
+and from that anchor decides where a stamped buffer must land in the ring. Three consequences, none
+of which a USRP shows:
+
+* **A per-start emission offset.** The anchor has one-buffer granularity (2048 samples ≈ 89 µs)
+  plus the race of when the DMA reader actually started, plus a whole-lap ambiguity (22.76 ms).
+  Commit 8b0244b5 reduced it to about ±100 µs when no lap intervenes, but it is still a random
+  constant per start. OCUDU measures it from the SSB loopback (`align.py`) and applies it as the
+  runtime RX timestamp shift — effectively a per-start `time_alignment_calibration`.
+* **The hardware cannot hold samples.** If the writer is late the ring is emitted regardless
+  (stale or zero data), so the plugin's only recourse is to re-anchor, which moves the timeline and
+  instantly de-aligns an attached UE. The guardian detects re-anchors and re-measures.
+* **Late-write storms.** Once behind, every subsequent write is late and the plugin re-anchors on
+  each one (5000–7000/min observed) until the process is restarted; a hardware-timed stream has no
+  equivalent failure mode.
+
+RX on the M2SDR is hardware-stamped, so RX and true air time agree; it is TX that floats — and PRACH
+format B4's twelve identical symbol repetitions alias that float modulo 33 µs, which is why random
+access looked healthy while every PUSCH missed (§3.4).
+
+Other radios for comparison: PlutoSDR/libiio has no timestamps at all and is in the same class or
+worse; the M2SDR gateware previously had a hardware TimedTX arbiter (CSRs at 0x148xx) that this branch
+removed in favour of the software timeline. The durable fix is to put the timestamp compare back in
+hardware — a TX header the DMA reader honours (hold until time, drop if late) with PROG-mode DMA so
+the lap race disappears — after which the OCUDU-side shift and guardian become unnecessary.
+
 ## 4. What changed in m2sdr (`~/m2sdr`, branch `working-ue`, by the m2sdr agent session)
 
 The installed plugin `/usr/local/lib/SoapySDR/modules0.8/libSoapyLiteXM2SDR.so` is from 8b0244b5
