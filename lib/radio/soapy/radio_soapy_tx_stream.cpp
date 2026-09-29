@@ -5,13 +5,31 @@
 #include "ocudu/gateways/baseband/buffer/baseband_gateway_buffer_reader_view.h"
 #include "ocudu/ocuduvec/zero.h"
 #include <SoapySDR/Errors.hpp>
+#include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
 using namespace ocudu;
 
+/// Maximum number of consecutive writeStream timeouts tolerated for a single transmission.
+static constexpr unsigned MAX_WRITE_TIMEOUT_RETRIES = 100;
+
 /// Async status poll timeout in microseconds (1 ms).
 static constexpr long RECV_ASYNC_TIMEOUT_US = 1000;
+
+/// The LiteXM2SDR carries 12-bit samples, LSB-aligned in each 16-bit word. OCUDU uses the full 16-bit range.
+/// \note The gateware truncates to 12 bits, so out-of-range samples wrap instead of clipping. In 8-bit mode (forced
+/// above 61.44 MSps) the shift would have to be 8.
+static constexpr unsigned DEVICE_SAMPLE_SHIFT = 4;
+static constexpr int16_t  DEVICE_SAMPLE_MAX   = (1 << (15 - DEVICE_SAMPLE_SHIFT)) - 1;
+static constexpr int16_t  DEVICE_SAMPLE_MIN   = -(1 << (15 - DEVICE_SAMPLE_SHIFT));
+
+/// Rescales one OCUDU 16-bit sample component to the device sample width, clamping to the device range.
+static inline int16_t to_device_sample(int16_t value)
+{
+  return std::clamp(static_cast<int16_t>(value >> DEVICE_SAMPLE_SHIFT), DEVICE_SAMPLE_MIN, DEVICE_SAMPLE_MAX);
+}
 
 /// Samples-to-nanoseconds helper.
 static inline long long samples_to_ns(uint64_t samples, double srate_hz)
@@ -33,6 +51,7 @@ radio_soapy_tx_stream::radio_soapy_tx_stream(radio_soapy_device&       device_,
   nof_channels(desc.nof_channels),
   discontinuous_tx(desc.discontinuous_tx),
   power_ramping_buffer(desc.nof_channels, 0),
+  tx_scaled_buffer(desc.nof_channels, static_cast<unsigned>(desc.srate_hz / 1000)),
   logger(ocudulog::fetch_basic_logger("RF"))
 {
   ocudu_assert(std::isnormal(srate_hz) && srate_hz > 0.0, "Invalid sampling rate {}.", srate_hz);
@@ -52,6 +71,16 @@ radio_soapy_tx_stream::radio_soapy_tx_stream(radio_soapy_device&       device_,
     if (write_timeout_us < 0) {
       write_timeout_us = 0;
     }
+  }
+
+  if (const char* env = std::getenv("OCUDU_SOAPY_TX_DUMP")) {
+    tx_dump_base = env;
+    tx_dump_path = fmt::format("{}.0", tx_dump_base);
+    double skip_s = 2.0;
+    if (const char* skip_env = std::getenv("OCUDU_SOAPY_TX_DUMP_SKIP_S")) {
+      skip_s = std::strtod(skip_env, nullptr);
+    }
+    tx_dump_skip = static_cast<uint64_t>(srate_hz * skip_s);
   }
 
   mtu = device.get_stream_mtu(stream);
@@ -216,13 +245,78 @@ void radio_soapy_tx_stream::transmit(const baseband_gateway_buffer_reader&      
     return;
   }
 
-  unsigned sent_total = 0;
-  unsigned chunks     = 0;
+  // Rescale the samples from the OCUDU 16-bit range to the device sample width.
+  if (tx_scaled_buffer.get_nof_samples() < data_nof_samples) {
+    tx_scaled_buffer.resize(data_nof_samples);
+  }
+  for (unsigned ch = 0; ch != nof_channels; ++ch) {
+    span<const ci16_t> src = data[ch].subspan(data_start, data_nof_samples);
+    span<ci16_t>       dst = tx_scaled_buffer.get_writer()[ch];
+    for (unsigned i = 0; i != data_nof_samples; ++i) {
+      dst[i] = {to_device_sample(src[i].real()), to_device_sample(src[i].imag())};
+    }
+  }
+
+  // SIGUSR1 starts a new capture immediately.
+  if (!tx_dump_base.empty() && tx_dump_gen != soapy_debug_dump_generation.load(std::memory_order_relaxed)) {
+    tx_dump_gen      = soapy_debug_dump_generation.load(std::memory_order_relaxed);
+    tx_dump_path     = fmt::format("{}.{}", tx_dump_base, tx_dump_gen);
+    tx_dump_start_ts = 0;
+    tx_dump_skip     = 0;
+  }
+  if (!tx_dump_path.empty()) {
+    // Skip the configured time, then capture a timeline with zeros between bursts.
+    const uint64_t ts      = tx_md.ts + data_start;
+    double         dump_ms = 100.0;
+    if (const char* env = std::getenv("OCUDU_SOAPY_TX_DUMP_MS")) {
+      dump_ms = std::strtod(env, nullptr);
+    }
+    const uint64_t skip     = tx_dump_skip;
+    const size_t   dump_len = static_cast<size_t>(srate_hz * dump_ms / 1000.0);
+    if (tx_dump_start_ts == 0) {
+      tx_dump_start_ts = ts + skip;
+      tx_dump.assign(dump_len, ci16_t());
+    }
+    if (ts >= tx_dump_start_ts) {
+      const uint64_t offset = ts - tx_dump_start_ts;
+      if (offset < dump_len) {
+        const size_t n = std::min<size_t>(data_nof_samples, dump_len - offset);
+        std::copy_n(tx_scaled_buffer.get_reader()[0].begin(), n, tx_dump.begin() + offset);
+        ++tx_dump_count;
+      } else {
+        if (FILE* f = std::fopen(tx_dump_path.c_str(), "wb")) {
+          std::fwrite(tx_dump.data(), sizeof(ci16_t), tx_dump.size(), f);
+          std::fclose(f);
+        }
+        logger.info("Soapy TX dump: wrote {} samples from ts={} ({} bursts) to {}.",
+                    tx_dump.size(),
+                    tx_dump_start_ts,
+                    tx_dump_count,
+                    tx_dump_path);
+        fmt::print("Soapy TX dump: wrote {} samples from ts={} to {}.\n", tx_dump.size(), tx_dump_start_ts, tx_dump_path);
+        tx_dump_path.clear();
+        tx_dump_count = 0;
+      }
+    }
+  }
+
+  tx_lead_counter += data_nof_samples;
+  if (tx_lead_counter >= static_cast<uint64_t>(srate_hz * 5)) {
+    tx_lead_counter = 0;
+    long long hw_now = 0;
+    if (device.get_hardware_time(hw_now)) {
+      fmt::print("Soapy TX lead: stamps are {} us ahead of hardware time.\n", (time_ns - hw_now) / 1000);
+    }
+  }
+
+  unsigned sent_total      = 0;
+  unsigned chunks          = 0;
+  unsigned timeout_retries = 0;
   while (sent_total < data_nof_samples) {
     std::array<const void*, RADIO_MAX_NOF_CHANNELS> rd_buffs = {};
     const unsigned remaining = data_nof_samples - sent_total;
     for (unsigned ch = 0; ch != nof_channels; ++ch) {
-      rd_buffs[ch] = data[ch].subspan(data_start + sent_total, remaining).data();
+      rd_buffs[ch] = tx_scaled_buffer.get_reader()[ch].subspan(sent_total, remaining).data();
     }
 
     int chunk_flags = 0;
@@ -234,8 +328,16 @@ void radio_soapy_tx_stream::transmit(const baseband_gateway_buffer_reader&      
     const long long chunk_time_ns = time_ns + samples_to_ns(sent_total, srate_hz);
     const int ret = device.write_stream(stream, rd_buffs.data(), remaining, chunk_flags, chunk_time_ns, write_timeout_us);
     if (ret <= 0) {
-      if (ret == SOAPY_SDR_TIMEOUT) {
-        logger.warning("SoapySDR TX: writeStream timeout after {} us for stream {}.", write_timeout_us, stream_id);
+      if (ret == SOAPY_SDR_TIMEOUT || ret == 0) {
+        // A timeout is backpressure from a full TX ring, not an error. Retry until the stream is stopped or the wait
+        // exceeds the maximum, since dropping samples would break the continuous TX timeline.
+        if (!token.is_stop_requested() && ++timeout_retries <= MAX_WRITE_TIMEOUT_RETRIES) {
+          continue;
+        }
+        logger.warning("SoapySDR TX: writeStream timed out {} times ({} us each) for stream {}.",
+                       timeout_retries,
+                       write_timeout_us,
+                       stream_id);
       } else {
         logger.warning("SoapySDR TX: writeStream failed ret={} for stream {}.", ret, stream_id);
       }

@@ -15,6 +15,7 @@
 #include "ocudu/radio/radio_constants.h"
 #include "ocudu/radio/radio_factory.h"
 #include "ocudu/radio/radio_management_plane.h"
+#include <array>
 #include <memory>
 #include <vector>
 
@@ -34,9 +35,18 @@ class radio_session_soapy_impl : public radio_session, private radio_management_
   static_vector<port_to_stream_channel, RADIO_MAX_NOF_PORTS> tx_port_map;
   /// Global RX port index → (stream_idx, channel_idx).
   static_vector<port_to_stream_channel, RADIO_MAX_NOF_PORTS> rx_port_map;
+  /// Last configured frequencies and gains per port. The LiteXM2SDR plugin re-initialises the AD9361 in setupStream(),
+  /// so they are re-applied once the streams are started.
+  std::array<double, RADIO_MAX_NOF_PORTS> tx_freqs_Hz = {};
+  std::array<double, RADIO_MAX_NOF_PORTS> rx_freqs_Hz = {};
+  std::array<double, RADIO_MAX_NOF_PORTS> tx_gains_dB = {};
+  std::array<double, RADIO_MAX_NOF_PORTS> rx_gains_dB = {};
 
   std::vector<std::unique_ptr<radio_soapy_baseband_gateway>> bb_gateways;
   double                                                     actual_sampling_rate_Hz = 0.0;
+  /// Reference clock error in ppm, given by the device argument freq_corr_ppm. The requested LO frequencies are scaled
+  /// by (1 - freq_corr_ppm * 1e-6) so that a reference running fast by that amount produces the right carrier.
+  double freq_corr_ppm = 0.0;
 
   bool set_tx_gain_unprotected(unsigned port_idx, double gain_dB);
   bool set_rx_gain_unprotected(unsigned port_idx, double gain_dB);

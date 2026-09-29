@@ -1,0 +1,50 @@
+# gNB on LiteX-M2SDR via SoapySDR, TDD n78 20 MHz at 3600 MHz, core = qcore on 127.0.0.1:38412
+# Run through scripts/m2sdr/guardian.sh (needs OCUDU_LPHY_RX_TO_TX_DELAY_US=5000 and the runtime RX timestamp shift);
+# see docs/m2sdr_soapy_bringup.md.
+# Keep the carrier <= 40 MHz: the AD9361 analog filter tops out at 56 MHz.
+
+cu_cp:
+  amf:
+    addrs: 127.0.0.1
+    port: 38412
+    bind_addrs: 127.0.0.1
+    supported_tracking_areas:
+      - tac: 1
+        plmn_list:
+          - plmn: "00101"
+            tai_slice_support_list:
+              - sst: 1
+
+ru_sdr:
+  device_driver: soapy
+  device_args: driver=LiteXM2SDR,ad9361_fir_profile=bypass,rx_worker_packets=2048,freq_corr_ppm=1.327
+  srate: 23.04
+  tx_gain: -10             # = 10 dB attenuation on the M2SDR
+  rx_gain: 40
+  time_alignment_calibration: 0
+  expert_cfg:
+    tx_mode: continuous      # M2SDR software timed TX needs a gap-free DMA stream
+
+cell_cfg:
+  dl_arfcn: 640000   # 3600.00 MHz, n78
+  band: 78
+  channel_bandwidth_MHz: 20
+  common_scs: 30
+  plmn: "00101"
+  tac: 1
+  pci: 101
+  prach:
+    ra_resp_window: 20      # 10 ms: scheduler runs ~13 slots ahead of RX with the 5 ms DL lead
+
+log:
+  filename: /tmp/gnb.log
+  all_level: warning
+  phy_level: warning
+  mac_level: warning
+
+expert_phy:
+  max_proc_delay: 3
+  allow_request_on_empty_uplink_slot: true   # exercise the PUxCH request path on every UL slot
+
+
+

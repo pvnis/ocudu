@@ -7,12 +7,16 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <cstdio>
 #include <cstdlib>
 
 using namespace ocudu;
 
 /// Maximum consecutive empty reads before bailing out of receive().
 static constexpr unsigned MAX_TIMEOUT_COUNT = 10;
+
+/// The LiteXM2SDR carries 12-bit samples, LSB-aligned in each 16-bit word. OCUDU uses the full 16-bit range.
+static constexpr unsigned DEVICE_SAMPLE_SHIFT = 4;
 
 static inline long long samples_to_ns(uint64_t samples, double srate_hz)
 {
@@ -28,6 +32,24 @@ radio_soapy_rx_stream::radio_soapy_rx_stream(radio_soapy_device&       device_,
   ocudu_assert(std::isnormal(srate_hz) && srate_hz > 0.0, "Invalid sampling rate {}.", srate_hz);
   ocudu_assert(stream != nullptr, "RX stream must not be null.");
   mtu = device.get_stream_mtu(stream);
+  if (const char* env = std::getenv("OCUDU_SOAPY_RX_TS_SHIFT_FILE")) {
+    rx_ts_shift_file = env;
+  }
+  if (const char* env = std::getenv("OCUDU_SOAPY_RX_DUMP")) {
+    // Skip OCUDU_SOAPY_RX_DUMP_SKIP_S seconds (2 s by default), then capture OCUDU_SOAPY_RX_DUMP_MS milliseconds (100 ms by default).
+    double dump_ms = 100.0;
+    if (const char* ms_env = std::getenv("OCUDU_SOAPY_RX_DUMP_MS")) {
+      dump_ms = std::strtod(ms_env, nullptr);
+    }
+    double skip_s = 2.0;
+    if (const char* skip_env = std::getenv("OCUDU_SOAPY_RX_DUMP_SKIP_S")) {
+      skip_s = std::strtod(skip_env, nullptr);
+    }
+    rx_dump_base = env;
+    rx_dump_path = fmt::format("{}.0", rx_dump_base);
+    rx_dump_skip = static_cast<uint64_t>(srate_hz * skip_s);
+    rx_dump.reserve(static_cast<size_t>(srate_hz * dump_ms / 1000.0));
+  }
   if (const char* env = std::getenv("OCUDU_SOAPY_RX_TRACE")) {
     rx_trace_enabled = std::string_view(env) != "0";
   }
@@ -58,6 +80,32 @@ bool radio_soapy_rx_stream::start(long long time_ns)
     logger.error("Error: failed to activate RX stream {}. {}", id, device.get_error_message());
     return false;
   }
+
+  // Drain the samples the device buffered before the session started, so that the delivered timestamps track the
+  // hardware time. Otherwise the backlog never drains, since the session consumes samples at the real-time rate, and
+  // every uplink indication is delivered late.
+  uint64_t  drained = 0;
+  long long lag_ns  = 0;
+  while (drained < static_cast<uint64_t>(srate_hz * 2)) {
+    size_t                                          handle   = 0;
+    std::array<const void*, RADIO_MAX_NOF_CHANNELS> rd_buffs = {};
+    int                                             rd_flags = 0;
+    long long                                       rd_time  = 0;
+    long long                                       hw_now   = 0;
+    const int n = device.acquire_read_buffer(stream, handle, rd_buffs.data(), rd_flags, rd_time, 20000);
+    if (n <= 0) {
+      break;
+    }
+    device.release_read_buffer(stream, handle);
+    drained += static_cast<uint64_t>(n);
+    if ((rd_flags & SOAPY_SDR_HAS_TIME) && device.get_hardware_time(hw_now)) {
+      lag_ns = hw_now - rd_time;
+      if (lag_ns < 1000000) {
+        break;
+      }
+    }
+  }
+  fmt::print("Soapy RX: drained {} samples of startup backlog, lag is now {} us.\n", drained, lag_ns / 1000);
   return true;
 }
 
@@ -82,6 +130,33 @@ bool radio_soapy_rx_stream::stop()
   return true;
 }
 
+void radio_soapy_rx_stream::reload_ts_shift()
+{
+  long long target = 0;
+  if (FILE* f = std::fopen(rx_ts_shift_file.c_str(), "r")) {
+    if (std::fscanf(f, "%lld", &target) != 1) {
+      target = rx_ts_shift;
+    }
+    std::fclose(f);
+  } else {
+    logger.warning("Soapy RX: cannot open timestamp shift file {}.", rx_ts_shift_file);
+    return;
+  }
+  const int64_t delta = static_cast<int64_t>(target) - rx_ts_shift;
+  if (delta == 0) {
+    return;
+  }
+  rx_ts_shift = target;
+  if (delta < 0) {
+    rx_drop_pending += static_cast<uint64_t>(-delta);
+  } else {
+    rx_zero_pending += static_cast<uint64_t>(delta);
+  }
+  logger.info("Soapy RX: timestamp shift set to {} samples (delta {}).", rx_ts_shift, delta);
+  fmt::print("Soapy RX: timestamp shift set to {} samples ({} samples {}).\n", rx_ts_shift,
+             (delta < 0) ? -delta : delta, (delta < 0) ? "dropped" : "zero-filled");
+}
+
 baseband_gateway_receiver::metadata radio_soapy_rx_stream::receive(baseband_gateway_buffer_writer& buffs)
 {
   const auto receive_start = std::chrono::steady_clock::now();
@@ -102,8 +177,31 @@ baseband_gateway_receiver::metadata radio_soapy_rx_stream::receive(baseband_gate
   unsigned       overflow_count     = 0;
   bool           timestamp_captured = false;
 
+  if (rx_ts_shift_gen_seen != soapy_rx_ts_shift_generation.load(std::memory_order_relaxed)) {
+    rx_ts_shift_gen_seen = soapy_rx_ts_shift_generation.load(std::memory_order_relaxed);
+    reload_ts_shift();
+  }
   while (rxd_total < nsamples) {
     ++loops;
+    // Positive timestamp shift: insert zeros so the labels stay continuous.
+    if (rx_zero_pending > 0) {
+      if (!last_sample_ts_valid) {
+        rx_zero_pending = 0;
+      } else {
+        const unsigned z = static_cast<unsigned>(std::min<uint64_t>(rx_zero_pending, nsamples - rxd_total));
+        for (unsigned ch = 0; ch != buffs.get_nof_channels(); ++ch) {
+          ocuduvec::zero(buffs[ch].subspan(rxd_total, z));
+        }
+        if (!timestamp_captured) {
+          timestamp_captured = true;
+          ret.ts             = last_sample_ts;
+        }
+        rxd_total += z;
+        rx_zero_pending -= z;
+        last_sample_ts = ret.ts + rxd_total;
+        continue;
+      }
+    }
     size_t handle = remainder_handle;
     std::array<const void*, RADIO_MAX_NOF_CHANNELS> rd_buffs = remainder_buffs;
     int flags = remainder_flags;
@@ -145,8 +243,25 @@ baseband_gateway_receiver::metadata radio_soapy_rx_stream::receive(baseband_gate
     }
 
     timeout_count = 0;
-    const unsigned nchunk = static_cast<unsigned>(ret_samps);
-    const unsigned source_offset = (remainder_handle == static_cast<size_t>(-1)) ? 0 : remainder_offset;
+    unsigned nchunk        = static_cast<unsigned>(ret_samps);
+    unsigned source_offset = (remainder_handle == static_cast<size_t>(-1)) ? 0 : remainder_offset;
+    // Negative timestamp shift: discard hardware samples so the labels stay continuous.
+    if (rx_drop_pending > 0) {
+      const unsigned drop_now = static_cast<unsigned>(std::min<uint64_t>(rx_drop_pending, nchunk));
+      rx_drop_pending -= drop_now;
+      source_offset += drop_now;
+      nchunk -= drop_now;
+      if (nchunk == 0) {
+        device.release_read_buffer(stream, handle);
+        remainder_handle  = static_cast<size_t>(-1);
+        remainder_samps   = 0;
+        remainder_offset  = 0;
+        remainder_flags   = 0;
+        remainder_time_ns = 0;
+        remainder_buffs.fill(nullptr);
+        continue;
+      }
+    }
 
     // Capture timestamp from first block.
     if (!timestamp_captured) {
@@ -156,7 +271,18 @@ baseband_gateway_receiver::metadata radio_soapy_rx_stream::receive(baseband_gate
         last_time_ns       = first_time_ns;
         timestamp_captured = true;
         time_ns            = first_time_ns;
-        ret.ts             = static_cast<baseband_gateway_timestamp>(std::llround(time_ns * srate_hz / 1e9));
+        ret.ts             = static_cast<baseband_gateway_timestamp>(std::llround(time_ns * srate_hz / 1e9) + rx_ts_shift);
+        // Diagnostic: the hardware timestamp should continue exactly where the previous call ended.
+        if (last_sample_ts_valid && rxd_total == 0) {
+          const int64_t jump = static_cast<int64_t>(ret.ts) - static_cast<int64_t>(last_sample_ts);
+          if (jump > 2 || jump < -2) { // +-1..2 samples is ns-to-sample rounding jitter of the plugin timestamps
+            ++rx_ts_jumps;
+            logger.warning("Soapy RX: hardware timestamp discontinuity of {} samples ({:+.1f} us), overflows in call={}, total jumps={}.",
+                           jump, static_cast<double>(jump) * 1e6 / srate_hz, overflow_count, rx_ts_jumps);
+            fmt::print("Soapy RX: hardware timestamp discontinuity of {} samples ({:+.1f} us), overflows in call={}, total jumps={}.\n",
+                       jump, static_cast<double>(jump) * 1e6 / srate_hz, overflow_count, rx_ts_jumps);
+          }
+        }
       } else if (last_time_ns > 0 && std::isnormal(srate_hz)) {
         // Reconstruct from last known time + samples elapsed.
         time_ns            = last_time_ns;
@@ -164,7 +290,7 @@ baseband_gateway_receiver::metadata radio_soapy_rx_stream::receive(baseband_gate
         if (last_sample_ts_valid) {
           ret.ts = last_sample_ts;
         } else {
-          ret.ts = static_cast<baseband_gateway_timestamp>(std::llround(time_ns * srate_hz / 1e9));
+          ret.ts = static_cast<baseband_gateway_timestamp>(std::llround(time_ns * srate_hz / 1e9) + rx_ts_shift);
         }
       }
     }
@@ -172,10 +298,13 @@ baseband_gateway_receiver::metadata radio_soapy_rx_stream::receive(baseband_gate
     // Copy samples into the caller's buffer, clamped to remaining space.
     const unsigned copy_samps = std::min(nchunk, nsamples - rxd_total);
     for (unsigned ch = 0; ch != std::min(nof_channels, buffs.get_nof_channels()); ++ch) {
-      const auto* src = reinterpret_cast<const ci16_t*>(rd_buffs[ch]) + source_offset;
-      std::memcpy(buffs[ch].subspan(rxd_total, copy_samps).data(),
-                  src,
-                  copy_samps * sizeof(ci16_t));
+      const auto*  src = reinterpret_cast<const ci16_t*>(rd_buffs[ch]) + source_offset;
+      span<ci16_t> dst = buffs[ch].subspan(rxd_total, copy_samps);
+      // Rescale the device 12-bit samples to the OCUDU 16-bit range.
+      for (unsigned i = 0; i != copy_samps; ++i) {
+        dst[i] = {static_cast<int16_t>(src[i].real() * (1 << DEVICE_SAMPLE_SHIFT)),
+                  static_cast<int16_t>(src[i].imag() * (1 << DEVICE_SAMPLE_SHIFT))};
+      }
     }
 
     if (copy_samps == nchunk) {
@@ -202,6 +331,46 @@ baseband_gateway_receiver::metadata radio_soapy_rx_stream::receive(baseband_gate
       last_sample_ts = ret.ts + rxd_total;
       last_sample_ts_valid = true;
       last_time_ns = static_cast<long long>(std::llround(static_cast<double>(last_sample_ts) * 1e9 / srate_hz));
+    }
+  }
+
+  // SIGUSR1 starts a new capture immediately.
+  if (!rx_dump_base.empty() && rx_dump_gen != soapy_debug_dump_generation.load(std::memory_order_relaxed)) {
+    rx_dump_gen  = soapy_debug_dump_generation.load(std::memory_order_relaxed);
+    rx_dump_path = fmt::format("{}.{}", rx_dump_base, rx_dump_gen);
+    rx_dump.clear();
+    rx_dump_skip = 0;
+  }
+  if (!rx_dump_path.empty() && buffs.get_nof_channels() > 0) {
+    span<const ci16_t> samples = buffs[0].first(rxd_total);
+    if (rx_dump_skip >= samples.size()) {
+      rx_dump_skip -= samples.size();
+    } else {
+      if (rx_dump.empty()) {
+        rx_dump_start_ts = ret.ts + rx_dump_skip;
+      }
+      samples = samples.last(samples.size() - rx_dump_skip);
+      rx_dump_skip = 0;
+      const size_t n = std::min(samples.size(), rx_dump.capacity() - rx_dump.size());
+      rx_dump.insert(rx_dump.end(), samples.begin(), samples.begin() + n);
+      if (rx_dump.size() == rx_dump.capacity()) {
+        if (FILE* f = std::fopen(rx_dump_path.c_str(), "wb")) {
+          std::fwrite(rx_dump.data(), sizeof(ci16_t), rx_dump.size(), f);
+          std::fclose(f);
+        }
+        logger.info("Soapy RX dump: wrote {} samples starting at ts={} to {}.", rx_dump.size(), rx_dump_start_ts, rx_dump_path);
+        fmt::print("Soapy RX dump: wrote {} samples starting at ts={} to {}.\n", rx_dump.size(), rx_dump_start_ts, rx_dump_path);
+        rx_dump_path.clear();
+      }
+    }
+  }
+
+  rx_lag_counter += rxd_total;
+  if (rx_lag_counter >= static_cast<uint64_t>(srate_hz * 5)) {
+    rx_lag_counter = 0;
+    long long hw_now = 0;
+    if (device.get_hardware_time(hw_now)) {
+      fmt::print("Soapy RX lag: {} us behind hardware time.\n", (hw_now - samples_to_ns(ret.ts + rxd_total - rx_ts_shift, srate_hz)) / 1000);
     }
   }
 

@@ -2227,6 +2227,12 @@ static void configure_cli11_common_cell_args(CLI::App& app, du_high_unit_base_ce
   add_option(app, "--additional_plmns", cell_params.additional_plmns, "List of PLMNs")
       ->capture_default_str()
       ->check(plmn_is_valid);
+  add_option(app,
+             "--additional_bands",
+             cell_params.additional_bands,
+             "Additional NR bands covering this carrier, advertised in the SIB1 frequency band list")
+      ->capture_default_str()
+      ->check(CLI::Range(1, 512));
   add_option(app, "--tac", cell_params.tac, "TAC")->capture_default_str()->check([](const std::string& value) {
     std::stringstream ss(value);
     unsigned          tac;

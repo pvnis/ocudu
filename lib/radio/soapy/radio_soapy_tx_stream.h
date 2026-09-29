@@ -15,6 +15,8 @@
 #include "ocudu/support/synchronization/stop_event.h"
 #include <SoapySDR/Device.hpp>
 #include <chrono>
+#include <string>
+#include <vector>
 
 namespace ocudu {
 
@@ -35,6 +37,17 @@ class radio_soapy_tx_stream : public baseband_gateway_transmitter, public soapy_
   long                  write_timeout_us          = 200;
   /// Pre-zeroed power ramping buffer (CI16 samples per channel).
   baseband_gateway_buffer_dynamic power_ramping_buffer;
+  /// Staging buffer holding the TX samples rescaled to the device sample width.
+  baseband_gateway_buffer_dynamic tx_scaled_buffer;
+  /// Debug capture of the channel 0 TX timeline to a file, enabled with OCUDU_SOAPY_TX_DUMP=<path>.
+  std::string         tx_dump_path;
+  std::string         tx_dump_base;
+  unsigned            tx_dump_gen      = 0;
+  uint64_t            tx_dump_skip     = 0;
+  std::vector<ci16_t> tx_dump;
+  uint64_t            tx_dump_start_ts = 0;
+  unsigned            tx_dump_count    = 0;
+  uint64_t            tx_lead_counter  = 0;
   radio_soapy_tx_stream_fsm       state_fsm;
   rt_stop_event_source            stop_control;
   ocudulog::basic_logger&         logger;

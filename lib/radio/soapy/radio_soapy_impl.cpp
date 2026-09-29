@@ -21,11 +21,13 @@ bool radio_session_soapy_impl::set_tx_gain_unprotected(unsigned port_idx, double
     return false;
   }
 
+  // The LiteXM2SDR plugin interprets TX gain as a positive attenuation in dB.
   const unsigned channel = tx_port_map[port_idx].second;
-  if (!device.set_gain(SOAPY_SDR_TX, channel, gain_dB)) {
+  if (!device.set_gain(SOAPY_SDR_TX, channel, -gain_dB)) {
     fmt::print("Error: setting TX gain for port {}. {}\n", port_idx, device.get_error_message());
     return false;
   }
+  tx_gains_dB[port_idx] = gain_dB;
 
   return true;
 }
@@ -42,6 +44,7 @@ bool radio_session_soapy_impl::set_rx_gain_unprotected(unsigned port_idx, double
     fmt::print("Error: setting RX gain for port {}. {}\n", port_idx, device.get_error_message());
     return false;
   }
+  rx_gains_dB[port_idx] = gain_dB;
 
   return true;
 }
@@ -58,10 +61,11 @@ bool radio_session_soapy_impl::set_tx_port_freq(unsigned port_idx, double freq_H
   }
 
   const unsigned channel = tx_port_map[port_idx].second;
-  if (!device.set_frequency(SOAPY_SDR_TX, channel, freq_Hz)) {
+  if (!device.set_frequency(SOAPY_SDR_TX, channel, freq_Hz * (1.0 - freq_corr_ppm * 1e-6))) {
     fmt::print("Error: setting TX frequency for port {}. {}\n", port_idx, device.get_error_message());
     return false;
   }
+  tx_freqs_Hz[port_idx] = freq_Hz;
 
   return true;
 }
@@ -74,10 +78,11 @@ bool radio_session_soapy_impl::set_rx_port_freq(unsigned port_idx, double freq_H
   }
 
   const unsigned channel = rx_port_map[port_idx].second;
-  if (!device.set_frequency(SOAPY_SDR_RX, channel, freq_Hz)) {
+  if (!device.set_frequency(SOAPY_SDR_RX, channel, freq_Hz * (1.0 - freq_corr_ppm * 1e-6))) {
     fmt::print("Error: setting RX frequency for port {}. {}\n", port_idx, device.get_error_message());
     return false;
   }
+  rx_freqs_Hz[port_idx] = freq_Hz;
 
   return true;
 }
@@ -93,6 +98,14 @@ radio_session_soapy_impl::radio_session_soapy_impl(const radio_configuration::ra
   actual_sampling_rate_Hz = radio_config.sampling_rate_Hz;
 
   // Open the SoapySDR device.
+  {
+    const SoapySDR::Kwargs dev_kwargs = SoapySDR::KwargsFromString(radio_config.args);
+    if (auto it = dev_kwargs.find("freq_corr_ppm"); it != dev_kwargs.end()) {
+      freq_corr_ppm = std::stod(it->second);
+      fmt::print("SoapySDR: applying LO frequency correction of {:+.3f} ppm.\n", freq_corr_ppm);
+    }
+  }
+
   if (!device.make(radio_config.args)) {
     fmt::print("Error: failed to open SoapySDR device with args '{}': {}\n",
                radio_config.args,
@@ -252,6 +265,32 @@ void radio_session_soapy_impl::start(baseband_gateway_timestamp init_time)
     if (!gateway->get_rx_stream().start(init_time_ns)) {
       fmt::print("Error: failed to start RX stream.\n");
     }
+  }
+
+  // The LiteXM2SDR plugin re-initialises the AD9361 in setupStream(), which drops the frequencies and gains set
+  // before it. Report what the device ended up with, then re-apply the configured values.
+  static constexpr std::array<std::pair<int, const char*>, 2> directions = {{{SOAPY_SDR_TX, "TX"}, {SOAPY_SDR_RX, "RX"}}};
+  for (const auto& [direction, name] : directions) {
+    const auto& port_map = (direction == SOAPY_SDR_TX) ? tx_port_map : rx_port_map;
+    for (unsigned port_idx = 0, nof_ports = port_map.size(); port_idx != nof_ports; ++port_idx) {
+      double freq_Hz = 0, gain_dB = 0, srate_Hz = 0;
+      if (device.get_rf_settings(direction, port_map[port_idx].second, freq_Hz, gain_dB, srate_Hz)) {
+        fmt::print("SoapySDR {} port {} before re-apply: freq={:.3f} MHz gain={:.1f} dB srate={:.3f} MHz.\n",
+                   name,
+                   port_idx,
+                   freq_Hz / 1e6,
+                   gain_dB,
+                   srate_Hz / 1e6);
+      }
+    }
+  }
+  for (unsigned port_idx = 0, nof_ports = tx_port_map.size(); port_idx != nof_ports; ++port_idx) {
+    set_tx_port_freq(port_idx, tx_freqs_Hz[port_idx]);
+    set_tx_gain_unprotected(port_idx, tx_gains_dB[port_idx]);
+  }
+  for (unsigned port_idx = 0, nof_ports = rx_port_map.size(); port_idx != nof_ports; ++port_idx) {
+    set_rx_port_freq(port_idx, rx_freqs_Hz[port_idx]);
+    set_rx_gain_unprotected(port_idx, rx_gains_dB[port_idx]);
   }
 }
 

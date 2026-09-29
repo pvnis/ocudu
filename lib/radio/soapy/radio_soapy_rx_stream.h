@@ -11,6 +11,8 @@
 #include "ocudu/radio/radio_constants.h"
 #include "ocudu/support/synchronization/stop_event.h"
 #include <SoapySDR/Device.hpp>
+#include <string>
+#include <vector>
 #include <atomic>
 #include <array>
 
@@ -37,6 +39,22 @@ class radio_soapy_rx_stream : public baseband_gateway_receiver, public soapy_exc
   long rx_trace_slow_us = 200;
   uint64_t rx_trace_limit = 0;
   std::atomic<uint64_t> rx_trace_seq{0};
+  /// Debug capture of channel 0 to a file, enabled with OCUDU_SOAPY_RX_DUMP=<path>.
+  std::string          rx_dump_path;
+  std::string          rx_dump_base;
+  unsigned             rx_dump_gen = 0;
+  std::vector<ci16_t>  rx_dump;
+  uint64_t             rx_dump_skip = 0;
+  uint64_t             rx_dump_start_ts = 0;
+  uint64_t             rx_lag_counter   = 0;
+  /// Runtime timestamp shift in samples (label = hardware timestamp + shift), reloaded on SIGUSR2.
+  int64_t     rx_ts_shift          = 0;
+  uint64_t    rx_ts_jumps          = 0;
+  unsigned    rx_ts_shift_gen_seen = 0;
+  uint64_t    rx_drop_pending      = 0;
+  uint64_t    rx_zero_pending      = 0;
+  std::string rx_ts_shift_file     = "/tmp/ocudu_soapy_rx_ts_shift";
+  void        reload_ts_shift();
   baseband_gateway_timestamp last_ret_ts = 0;
   bool last_ret_ts_valid = false;
   size_t remainder_handle = static_cast<size_t>(-1);

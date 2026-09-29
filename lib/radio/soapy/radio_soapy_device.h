@@ -5,7 +5,11 @@
 
 #include "radio_soapy_exception_handler.h"
 #include "ocudu/ocudulog/ocudulog.h"
+#include "fmt/chrono.h"
 #include <SoapySDR/Device.hpp>
+#include <atomic>
+#include <chrono>
+#include <csignal>
 #include <SoapySDR/Formats.hpp>
 #include <SoapySDR/Logger.hpp>
 #include <SoapySDR/Types.hpp>
@@ -19,6 +23,14 @@
 namespace ocudu {
 
 /// Thin wrapper around SoapySDR::Device providing safe_execution semantics.
+/// Debug dump generation, incremented by SIGUSR1. The TX and RX streams start a new capture whenever it changes.
+inline std::atomic<unsigned> soapy_debug_dump_generation{0};
+/// RX timestamp-shift generation, incremented by SIGUSR2. The RX stream then reloads the shift (in samples) from the
+/// file named by OCUDU_SOAPY_RX_TS_SHIFT_FILE (default /tmp/ocudu_soapy_rx_ts_shift) and applies it to the sample
+/// timestamps handed to the lower PHY, keeping the stream continuous (drops samples for a negative shift, inserts
+/// zeros for a positive one). This compensates the M2SDR software-timed TX offset measured after start-up.
+inline std::atomic<unsigned> soapy_rx_ts_shift_generation{0};
+
 class radio_soapy_device : public soapy_exception_handler
 {
 public:
@@ -26,28 +38,16 @@ public:
   {
     static std::once_flag registered;
     std::call_once(registered, []() {
+      // The plugin logs from its own worker threads. Print to the console instead of feeding the OCUDU logger from
+      // threads it does not manage.
       SoapySDR::registerLogHandler([](const SoapySDRLogLevel level, const char* message) {
-        ocudulog::basic_logger& lg = ocudulog::fetch_basic_logger("RF");
-        switch (level) {
-          case SOAPY_SDR_FATAL:
-          case SOAPY_SDR_CRITICAL:
-          case SOAPY_SDR_ERROR:
-            lg.error("SoapySDR: {}", message);
-            break;
-          case SOAPY_SDR_WARNING:
-            lg.warning("SoapySDR: {}", message);
-            break;
-          case SOAPY_SDR_NOTICE:
-          case SOAPY_SDR_INFO:
-            lg.info("SoapySDR: {}", message);
-            break;
-          case SOAPY_SDR_DEBUG:
-          case SOAPY_SDR_TRACE:
-          default:
-            lg.debug("SoapySDR: {}", message);
-            break;
+        if (level <= SOAPY_SDR_INFO) {
+          const auto now = std::chrono::system_clock::now();
+          fmt::print("{:%H:%M:%S} SoapySDR[{}]: {}\n", now, static_cast<int>(level), message);
         }
       });
+      std::signal(SIGUSR1, [](int) { soapy_debug_dump_generation.fetch_add(1, std::memory_order_relaxed); });
+      std::signal(SIGUSR2, [](int) { soapy_rx_ts_shift_generation.fetch_add(1, std::memory_order_relaxed); });
     });
 
     if (const char* env = std::getenv("OCUDU_SOAPY_TRACE")) {
@@ -88,6 +88,16 @@ public:
   {
     logger.debug("Setting {} ch{} frequency to {:.3f} MHz.", direction == SOAPY_SDR_TX ? "TX" : "RX", channel, to_MHz(freq_Hz));
     return safe_execution([this, direction, channel, freq_Hz]() { device->setFrequency(direction, channel, freq_Hz); });
+  }
+
+  /// Reads back the RF frequency, gain and sample rate of a channel. Returns false on error.
+  bool get_rf_settings(int direction, size_t channel, double& freq_Hz, double& gain_dB, double& srate_Hz)
+  {
+    return safe_execution([this, direction, channel, &freq_Hz, &gain_dB, &srate_Hz]() {
+      freq_Hz  = device->getFrequency(direction, channel);
+      gain_dB  = device->getGain(direction, channel);
+      srate_Hz = device->getSampleRate(direction, channel);
+    });
   }
 
   bool set_gain(int direction, size_t channel, double gain_dB)

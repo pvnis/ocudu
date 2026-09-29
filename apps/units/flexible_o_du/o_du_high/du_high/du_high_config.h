@@ -1054,6 +1054,8 @@ struct du_high_unit_base_cell_config {
   int q_rx_lev_min = -70;
   /// \c q-QualMin, part of \c cellSelectionInfo, \c SIB1, TS 38.311, in dB.
   int q_qual_min = -20;
+  /// Additional NR bands that also cover this carrier, advertised after \c band in the SIB1 \c frequencyBandList.
+  std::vector<unsigned> additional_bands;
   /// SSB parameters.
   du_high_unit_ssb_config ssb_cfg;
   /// SIB parameters.

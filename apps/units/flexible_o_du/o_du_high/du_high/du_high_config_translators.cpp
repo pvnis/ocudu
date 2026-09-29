@@ -11,6 +11,7 @@
 #include "ocudu/du/du_high/du_high_configuration.h"
 #include "ocudu/du/du_high/du_qos_config_helpers.h"
 #include "ocudu/du/du_update_config_helpers.h"
+#include "ocudu/ran/band_helper.h"
 #include "ocudu/ran/duplex_mode.h"
 #include "ocudu/ran/pdcch/pdcch_candidates.h"
 #include "ocudu/ran/prach/prach_configuration.h"
@@ -553,6 +554,10 @@ std::vector<odu::du_cell_config> ocudu::generate_du_cell_config(const du_high_un
     // > Carrier config.
     out_cell.ran.dl_carrier.nof_ant = base_cell.nof_antennas_dl;
     out_cell.ran.ul_carrier.nof_ant = base_cell.nof_antennas_ul;
+    for (unsigned extra_band : base_cell.additional_bands) {
+      out_cell.ran.dl_cfg_common.freq_info_dl.freq_band_list.push_back({uint_to_nr_band(extra_band)});
+      out_cell.ran.ul_cfg_common.freq_info_ul.freq_band_list.push_back({uint_to_nr_band(extra_band)});
+    }
     // > System Information.
     fill_si_acquisition_info(out_cell.si, base_cell);
     if (out_cell.si.si_config.has_value()) {

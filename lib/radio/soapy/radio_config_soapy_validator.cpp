@@ -137,12 +137,6 @@ bool radio_config_soapy_validator::is_configuration_valid(const radio_configurat
     return false;
   }
 
-  // Transmission mode: continuous burst is not meaningful for M2SDR timed TX.
-  if (config.tx_mode == radio_configuration::transmission_mode::continuous) {
-    fmt::print("M2SDR does not support continuous transmission mode; use discontinuous or same_port.\n");
-    return false;
-  }
-
   if (config.power_ramping_us < 0) {
     fmt::print("Power ramping time {:.1f} us must be zero or positive.\n", config.power_ramping_us);
     return false;
