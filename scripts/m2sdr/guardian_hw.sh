@@ -19,6 +19,11 @@ start_gnb(){
   timeout 20 sudo -b sh -c "env OCUDU_LPHY_RX_TO_TX_DELAY_US=5000 OCUDU_SOAPY_RX_TS_SHIFT=$SHIFT nohup $B/apps/gnb/gnb -c $B/gnb_soapy_m2sdr_hwtimed.yml > $L 2>&1 < /dev/null"
   sleep 20; log "gNB started (shift $SHIFT): $(pgrep -x gnb >/dev/null && echo up || echo FAILED)"
 }
+# DRM KMS connector polling causes periodic ~10 s scheduling hiccups on this host; the gNB flags it
+# ("DRM KMS polling is enabled, which may hinder performance"). A single hiccup makes the MAC skip a
+# slot indication ("DL task queue is full"), which re-opens the scheduler-vs-RX slot misalignment and
+# locks the UL into a permanent PUxCH-late storm. Disable it (reversible; resets on reboot).
+echo N | sudo tee /sys/module/drm_kms_helper/parameters/poll >/dev/null 2>&1 && log "DRM KMS polling disabled"
 rm -f $STOP; log "guardian_hw start"; start_gnb
 last_reg=""; last_puxch=0; last_busy=0; last_late=$((16#$(reg 0x1580c | cut -c3-))); last_health=$(date +%s)
 while [ ! -f $STOP ]; do

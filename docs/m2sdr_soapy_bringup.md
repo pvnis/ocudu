@@ -352,6 +352,16 @@ all (2 µs is well inside the PRACH detection window); the constant goes into th
     request is spuriously late. Verified over many cold restarts: PUxCH-late drops to a ~100-200
     startup transient with no persistent storm (was thousands on ~1/3-1/2 of starts).
   - `guardian_hw.sh` keeps the storm restart guard as a belt-and-braces safety net.
+  - **Runtime re-trigger (found after the fix).** With the start race fixed, a run stayed clean for
+    ~8 s, then a single host stall — `[MAC] Skipped slot indication ... DL task queue is full` (2
+    slots) → `late DL_TTI.request` — re-opened the *same* 64-aliasing misalignment and locked into a
+    permanent 20 000+/min UL-busy storm. The misalignment never self-corrects, at start or mid-run.
+    The stall source here is **DRM KMS connector polling** (`/sys/module/drm_kms_helper/parameters/poll
+    = Y`), which the gNB explicitly warns about; disabling it (`echo N | sudo tee
+    /sys/module/drm_kms_helper/parameters/poll`, done in `guardian_hw.sh`, resets on reboot) removed
+    the stalls and the gNB ran clean for minutes with the phone's UL alive. A fully robust fix would
+    re-anchor on any detected mid-run slot discontinuity; disabling the stall source is the pragmatic
+    cure since the misalignment is only ever seeded by a stall.
 
 * Genuine host stalls (> TX lead of 4.8 ms) still cost DL frames (dropped as late, silence) and a
   burst restart in OCUDU; that is the intended USRP-like behaviour, but the stall itself is the host's
