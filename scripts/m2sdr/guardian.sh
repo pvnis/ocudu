@@ -1,4 +1,7 @@
 #!/bin/bash
+# NOTE: software-timed mode. It relies on OCUDU_LPHY_RX_TO_TX_DELAY_US and the 64-entry request pool, which were
+# removed from the OCUDU core on 2026-09-30 (docs/m2sdr_soapy_bringup.md 8.6); use commit 091bb33298 or earlier,
+# or guardian_hw.sh with the hardware-timed m2sdr branch.
 # Low-frequency overnight guardian. Keeps the gNB alive on a good-timing start, watches phone registration.
 # Logs only on change/success. Stop by: touch /home/dmd/ocudu/build/captures/guardian.stop
 set +e

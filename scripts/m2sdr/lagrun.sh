@@ -1,9 +1,10 @@
 #!/bin/bash
 # One gNB run for RX delivery-lag work.
 # Usage: lagrun.sh <label> <seconds>
-# Env: DELAY  = OCUDU_LPHY_RX_TO_TX_DELAY_US (empty -> not set = stock 1 ms)
+# Env: DELAY  = OCUDU_LPHY_RX_TO_TX_DELAY_US (only builds up to commit 091bb33298 have that knob; stock OCUDU
+#               ignores it and uses 1 ms)
 #      RXIRQ / TXIRQ = kernel buffers per interrupt (sysfs, applied at stream start)
-#      DEVX   = extra device args (e.g. rx_poll=busy)
+#      DEVX   = extra device args (e.g. rx_poll=busy, tx_dma=loop)
 #      STATS  = worker lag report period in seconds (default 10), EVERY = measure every n-th buffer
 #      YML    = config (default gnb_soapy_m2sdr_hwtimed.yml)
 B=/home/dmd/ocudu/build; C=$B/captures; LBL=$1; SECS=$2

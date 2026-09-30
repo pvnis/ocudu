@@ -3,8 +3,9 @@
 # domain, stamps each RX frame with the index of its first sample and emits every TX sample at its index.
 # device_args timed_tx=hardware,time_base=samples: all times exchanged with the radio are sample counts.
 # The constant RX-minus-TX offset (42 samples, scripts/m2sdr/align.py) is applied once with
-# OCUDU_SOAPY_RX_TS_SHIFT=-42. Run through scripts/m2sdr/guardian_hw.sh (OCUDU_LPHY_RX_TO_TX_DELAY_US=4000; needs the
-# m2sdr kernel module with rx_irq_period=1, its default on that branch);
+# OCUDU_SOAPY_RX_TS_SHIFT=-42. Run through scripts/m2sdr/guardian_hw.sh. The lower PHY and all PHY timing
+# settings are OCUDU defaults; this needs the m2sdr kernel module of branch hw-timed-tx (one interrupt per
+# RX buffer, FIFO TX queue);
 # see docs/m2sdr_soapy_bringup.md section 8.
 # Keep the carrier <= 40 MHz: the AD9361 analog filter tops out at 56 MHz.
 
@@ -28,7 +29,7 @@ ru_sdr:
   rx_gain: 40
   time_alignment_calibration: 0
   expert_cfg:
-    tx_mode: continuous      # M2SDR software timed TX needs a gap-free DMA stream
+    tx_mode: continuous      # gap-free TX stream (discontinuous mode is untested on the hardware-timed path)
 
 cell_cfg:
   dl_arfcn: 640000   # 3600.00 MHz, n78
@@ -38,19 +39,9 @@ cell_cfg:
   plmn: "00101"
   tac: 1
   pci: 101
-  prach:
-    ra_resp_window: 20      # 10 ms: the scheduler runs ~11 slots ahead of RX (4 ms DL lead + max_proc_delay 3), so
-                            # the RAR cannot make the default 5 ms window
 
 log:
   filename: /tmp/gnb.log
   all_level: warning
   phy_level: warning
   mac_level: warning
-
-expert_phy:
-  max_proc_delay: 3
-  allow_request_on_empty_uplink_slot: true   # exercise the PUxCH request path on every UL slot
-
-
-

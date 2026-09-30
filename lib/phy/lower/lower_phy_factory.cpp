@@ -4,7 +4,6 @@
 
 #include "ocudu/phy/lower/lower_phy_factory.h"
 #include "lower_phy_impl.h"
-#include <cstdlib>
 
 using namespace ocudu;
 
@@ -39,18 +38,6 @@ using namespace ocudu;
 ///                                       maps to \f$N_{\textup{TA, offset}}\f$.
 /// \param[in] srate                      Sampling rate.
 /// \return The transmit time offset as a number of samples.
-/// Returns how far ahead of the last received timestamp the downlink baseband is generated, in samples. The default
-/// is one millisecond. Radios that must be fed ahead of a DMA ring (e.g. SoapySDR LiteX-M2SDR) need more, which can be
-/// set with the OCUDU_LPHY_RX_TO_TX_DELAY_US environment variable.
-static unsigned get_rx_to_tx_delay_samples(sampling_rate srate)
-{
-  unsigned delay_us = 1000;
-  if (const char* env = std::getenv("OCUDU_LPHY_RX_TO_TX_DELAY_US")) {
-    delay_us = std::max(1000L, std::strtol(env, nullptr, 10));
-  }
-  return static_cast<unsigned>(srate.to_kHz() * delay_us / 1000);
-}
-
 static int get_tx_time_offset(int time_alignment_calibration, n_ta_offset ta_offset, sampling_rate srate)
 {
   // Calculate the time alignment offset.
@@ -110,7 +97,7 @@ public:
     int tx_time_offset = get_tx_time_offset(config.time_alignment_calibration, config.ta_offset, config.srate);
 
     // Maximum time delay between reception and transmission in samples (1ms plus the time offset).
-    unsigned rx_to_tx_max_delay = get_rx_to_tx_delay_samples(config.srate) + tx_time_offset;
+    unsigned rx_to_tx_max_delay = config.srate.to_kHz() + tx_time_offset;
 
     // Prepare downlink processor configuration.
     downlink_processor_configuration dl_proc_config = {.sector_id               = config.sector_id,
@@ -147,7 +134,7 @@ public:
         .nof_tx_ports           = config.nof_tx_ports,
         .nof_rx_ports           = config.nof_rx_ports,
         .tx_time_offset         = static_cast<baseband_gateway_timestamp>(tx_time_offset),
-        .rx_to_tx_max_delay     = get_rx_to_tx_delay_samples(config.srate) + proc_bb_adaptor_config.tx_time_offset,
+        .rx_to_tx_max_delay     = config.srate.to_kHz() + proc_bb_adaptor_config.tx_time_offset,
         .rx_buffer_size         = rx_buffer_size,
         .nof_rx_buffers         = std::max(4U, rx_to_tx_max_delay / rx_buffer_size),
         .system_time_throttling = config.system_time_throttling,

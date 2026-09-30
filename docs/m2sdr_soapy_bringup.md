@@ -24,7 +24,7 @@ Everything below is on the `soapy` branch of OCUDU and the `working-ue` branch o
 | `expert_phy.max_proc_delay` | 3 | with the 5 ms DL lead (below) keeps PRACH requests in time |
 | `expert_phy.allow_request_on_empty_uplink_slot` | true | diagnostic, harmless: exercises the PUxCH request path on every UL slot |
 | `log` | all warning | PHY/MAC `info` was used for diagnosis; too chatty with an attached UE |
-| environment | `OCUDU_LPHY_RX_TO_TX_DELAY_US=5000` | DL is generated 5 ms ahead of RX instead of 1 ms so the DMA ring never runs dry |
+| environment | `OCUDU_LPHY_RX_TO_TX_DELAY_US=5000` | DL is generated 5 ms ahead of RX instead of 1 ms so the DMA ring never runs dry. **Software-timed mode only**: the knob was removed on 2026-09-30 (§8.6); that mode needs commit 091bb33298 or earlier |
 
 Do **not** add `expert_execution` affinities/partitions or change thread priorities (§6).
 
@@ -64,11 +64,10 @@ All in the working tree of branch `soapy`, committed with this document.
 
 ### 2.2 `lib/phy/lower/lower_phy_factory.cpp`
 
-* `OCUDU_LPHY_RX_TO_TX_DELAY_US` (default 1000, minimum 1000) sets how far ahead of the last received
-  sample the DL is generated (`rx_to_tx_max_delay`). 5 ms was needed with the software-timed TX; with
-  the hardware-timed TX and the RX delivery lag removed the guardian uses 4 ms (§8.6). This is the only
-  remaining change outside `lib/radio/soapy`.
-* (The RX buffer pool floor, raised from 4 to 16 buffers during the bring-up, is back to stock.)
+**Reverted to stock on 2026-09-30** (§8.6): with the hardware-timed TX, the RX delivery lag removed and the
+FIFO TX queue in the m2sdr driver, the stock 1 ms between the newest RX sample and the DL works.
+History: an `OCUDU_LPHY_RX_TO_TX_DELAY_US` knob (5 ms with the software-timed TX) and an RX buffer pool
+floor of 16.
 
 ### 2.3 `lib/phy/lower/processors/resource_request_pool.h`
 
@@ -377,7 +376,7 @@ OCUDU's lower PHY silently relies on three properties that UHD radios have. The 
 |---|---|---|
 | Sample-exact, contiguous timestamps | time specs are ticks of the sample clock | the FPGA counts samples in the RF clock domain and stamps each RX frame with the index of its first sample |
 | Timed RX start | `issue_stream_cmd(time_spec, stream_now=false)` | FPGA `timed_rx_start` gate; the first frame is the requested tick |
-| Bounded, back-pressured TX FIFO | flow-controlled `send()` | `tx_fifo_buffers` (default 96 = 8.5 ms); the Soapy adapter waits like the UHD adapter |
+| Bounded, back-pressured TX FIFO | flow-controlled `send()` | FIFO DMA queue: one descriptor per submitted frame, the reader stops when it is empty (`tx_dma=fifo`), bounded by `tx_fifo_buffers` (default 96 = 8.5 ms); the Soapy adapter waits like the UHD adapter |
 | Timed TX | FPGA emits each sample at its tick | `timed_tx` gate (whole-frame hold/late/stale) + RF-domain fine gate (every word in the slot of its own tick) |
 
 With `time_base=samples` in `device_args` every SoapySDR "timeNs" value exchanged with the plugin is a
@@ -389,10 +388,10 @@ between the lower PHY and the converters, and no second oscillator in the timing
 At start the DL now runs 27–28 slots ahead of RX (5 ms budget + FIFO) instead of 177–194, and the first
 RX label equals `init_time`.
 
-Remaining OCUDU core delta for this radio: `OCUDU_LPHY_RX_TO_TX_DELAY_US` in `lower_phy_factory.cpp`
-(§8.6). The request pool and the RX buffer floor are stock again.
+There is no OCUDU core delta left for this radio: `lib/phy` is identical to the branch point (§8.6). What
+remains outside `lib/radio/soapy` is unrelated to timing (`additional_bands`, the radio factory hook).
 
-### 8.6 RX delivery lag, interrupts, and what still keeps the DL lead above 1 ms
+### 8.6 RX delivery lag, the FIFO TX queue, and stock OCUDU timing
 
 Full write-up with all numbers: `~/m2sdr/doc/rx_delivery_lag.md`.
 
@@ -407,30 +406,34 @@ Full write-up with all numbers: `~/m2sdr/doc/rx_delivery_lag.md`.
 As seen by the lower PHY: 355 µs average before, 20 µs now. Two causes were fixed in the m2sdr kernel
 driver: the interrupt cadence (module parameter `rx_irq_period`, now 1) and an off-by-one in the
 completed-buffer count that withheld the newest complete buffer until the next interrupt. The adapter
-now prints min/avg/max for `Soapy RX lag` and `Soapy TX lead` every 5 s (about 20 samples per second).
+prints min/avg/max for `Soapy RX lag` and `Soapy TX lead` every 5 s (about 20 samples per second).
 
-**What that allowed in OCUDU:** `resource_request_pool.h` back to 16 entries, RX buffer floor back to 4,
-and the DL lead from 5 ms to 4 ms (`guardian_hw.sh [shift] [delay_us]`). The TX lead at hand-off is now
-the configured delay minus ~50 µs (it was the delay minus 0.5–0.8 ms).
+**The TX ring was the second obstacle.** With the RX lag gone the DL lead could shrink, but the TX DMA
+reader free-ran through a 256-slot ring, paced only by the timed gate holding the frame at its head.
+When a host stall let it catch up with the write pointer, every slot ahead held a stale frame, which
+the gate drops at PCIe speed; the reader then lapped the ring every ~2 ms (137 840 frames/s measured,
+11 272 nominal) and the host could not get back in front of it for 70–80 ms. One stall cost ~500 late
+frames. In that mode: 1000 µs continuous episodes, 1500 µs 8–12 per 45 s, 2000 µs an episode when the
+phone attached, 4000 µs one in a 5-minute soak.
 
-**Why not the stock 1 ms:** the RX side would allow it, the TX ring does not. The TX DMA reader
-free-runs through a 256-slot ring and is paced only by the timed gate holding the frame at its head.
-When a host stall lets it catch up with the write pointer, every slot ahead holds a stale frame, which
-the gate drops at PCIe speed; the reader then laps the ring every ~2 ms and the host cannot get back in
-front of it for 70–80 ms. So one stall longer than (delay − ~0.55 ms) costs ~500 late frames instead of
-the few that were really late:
+**FIFO TX queue** (m2sdr kernel driver + libm2sdr, device argument `tx_dma=fifo`, the default in
+hardware-timed mode): the driver queues one DMA descriptor per submitted frame (LitePCIe table "prog"
+mode) and the reader stops when the queue is empty, like a USRP's TX FIFO. A frame needs only the PCIe
+fetch time of lead, nothing is read twice, and a late frame costs only itself.
 
-| `OCUDU_LPHY_RX_TO_TX_DELAY_US` | result |
-|---|---|
-| 5000 | clean in the soaks; an episode needs a stall above ~4.4 ms |
-| 4000 (guardian default) | one episode in a first 5-minute soak with phone traffic, none in the following 11 minutes; 6 of 6 starts attach and ping 150/150 |
-| 2000 | clean for minutes, then an episode when the phone attached (+1000 late frames, guardian restart) |
-| 1500 | 8–12 episodes per 45 s |
-| 1000 (stock) | continuous |
+**Result: OCUDU is stock.** `lower_phy_factory.cpp` and `resource_request_pool.h` are back to the
+branch point, `OCUDU_LPHY_RX_TO_TX_DELAY_US` no longer exists, and `configs/gnb_soapy_m2sdr_hwtimed.yml`
+no longer overrides `prach.ra_resp_window`, `expert_phy.max_proc_delay` or
+`allow_request_on_empty_uplink_slot`. The DL is generated the stock 1 ms ahead of the newest RX sample;
+the TX lead at hand-off is ~950 µs on average.
 
-The fix is FIFO semantics for the TX DMA (LitePCIe table "prog" mode in the kernel driver, or a
-pre-stamped silence timeline in the ring); then 1 ms works with 0.7–0.9 ms of margin and the last core
-change can be dropped. Not done yet.
+Validation on stock OCUDU: 14-minute soak with the phone attached and pinging: 292 late frames of
+9.5 million (0–42 per minute), 0 stale, 0 `PUxCH request late`, 0 `UL processor is busy`, 0 RX
+discontinuities, no guardian restart, ping 2769/2800. The three starts before it attach and ping 150/150
+(149/150 once); the residual RX-minus-TX offset is still 0 samples with `OCUDU_SOAPY_RX_TS_SHIFT=-42`;
+HARQ error rates DL ~4 %, UL 4–9 % (DL 3–19 %, UL 10–28 % with the 4 ms lead). The late frames are host
+stalls of 0.6–1.7 ms (lowest TX leads per 5 s window: −765, 170, 195, 296 µs …); each costs the frames
+that were late and nothing else.
 
 **Would a DPDK poll-mode driver help?** Measured with `rx_poll=busy`, which is the PMD wake-up model on
 the existing driver: 4 µs better at the median, ~25 µs at p99, nothing in the tail, for one core at
@@ -438,8 +441,8 @@ the existing driver: 4 µs better at the median, ~25 µs at p99, nothing in the 
 shows gaps of up to 224 µs with interrupts disabled at least once per second, and the Wi-Fi interface
 re-associates every ~30 minutes with an 11.6 ms stall of everything. A PMD only pays with isolated
 cores, smaller frames (the 89 µs frame time is the real floor) or much higher frame rates, and it
-would replace the kernel driver's other functions and the SoapySDR path. The thing a PMD would bring
-that matters here, a descriptor-ring TX queue, is the FIFO fix above and does not need DPDK.
+would replace the kernel driver's other functions and the SoapySDR path. The thing a PMD would have
+brought that mattered here, a descriptor-ring TX queue, is the FIFO queue above and did not need DPDK.
 
 Host observations worth knowing: the Wi-Fi roam every ~30 min (kernel log, `wlp5s0: associated`) is a
-guaranteed RX discontinuity and a TX underrun; the link then recovers by itself.
+guaranteed RX discontinuity and a burst of late TX frames; the link recovers by itself.
