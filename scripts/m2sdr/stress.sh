@@ -31,7 +31,7 @@ phase baseline ":" ":"
 phase "host cpu: 6 busy loops (all cores, normal prio)" "spin 6" "unspin"
 phase "host cpu: 6 busy loops nice -n -5 (compete with TS threads)" "for i in 1 2 3 4 5 6; do ( sudo nice -n -5 sh -c 'while :; do :; done' & echo \$! ) ; done > $C/stress_spin.pids" "sudo xargs -r kill < $C/stress_spin.pids; sleep 1"
 phase "host disk+memory: dd/gzip loop" "( while :; do dd if=/dev/urandom bs=1M count=200 2>/dev/null | gzip -c > /dev/null; done ) & echo \$! > $C/stress_bg.pid" "kill \$(cat $C/stress_bg.pid) 2>/dev/null; pkill -x gzip; sleep 1"
-phase "DL throughput (host -> phone, tcp)" "( nc -l -p 5001 -q0 < /dev/zero > /dev/null & echo \$! > $C/stress_bg.pid ); ( sleep 2; timeout $((D-4)) adb shell 'nc $HOST 5001 > /dev/null' ) &" "kill \$(cat $C/stress_bg.pid) 2>/dev/null; pkill -f 'nc -l -p 5001'; sleep 1"
+phase "DL throughput (host -> phone, tcp)" "( nc -l -p 5001 -q0 < /dev/zero > /dev/null & echo \$! > $C/stress_bg.pid ); ( sleep 2; timeout $((D-4)) adb shell 'sleep 100000 | nc $HOST 5001 > /dev/null' ) &" "kill \$(cat $C/stress_bg.pid) 2>/dev/null; pkill -f 'nc -l -p 5001'; sleep 1"
 phase "UL throughput (phone -> host, tcp)" "( timeout $((D)) nc -l -p 5002 > $C/stress_rx.bin & echo \$! > $C/stress_bg.pid ); ( sleep 2; timeout $((D-4)) adb shell 'nc $HOST 5002 < /dev/zero' ) &" "kill \$(cat $C/stress_bg.pid) 2>/dev/null; pkill -f 'nc -l -p 5002'; echo \"UL bytes: \$(stat -c %s $C/stress_rx.bin) (\$(( \$(stat -c %s $C/stress_rx.bin) * 8 / $((D-4)) / 1000 )) kbit/s)\" > $C/stress_ul.txt; rm -f $C/stress_rx.bin" ""
 cat $C/stress_ul.txt | tee -a $R
 phase "Wi-Fi + CPU: host bulk download" "( timeout $D curl -s -o /dev/null http://speedtest.tele2.net/1GB.zip & ) " ":"
