@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: BSD-3-Clause-Open-MPI
 // Portions of this file may implement 3GPP specifications, which may be subject to additional licensing requirements.
 
+#include <cstdio>
 #include "lower_phy_baseband_processor.h"
 #include "ocudu/adt/interval.h"
 #include "ocudu/instrumentation/traces/ru_traces.h"
@@ -77,6 +78,35 @@ void lower_phy_baseband_processor::dl_process(baseband_gateway_timestamp timesta
   // Throttling mechanism to keep a maximum latency of one millisecond in the transmit buffer based on the latest
   // received timestamp.
   {
+    // Startup alignment: do not advance the DL/scheduler timeline until the RX timeline is live. The
+    // radio (e.g. the M2SDR Soapy plugin) may not honour a timed RX start, so RX begins ~100 ms after
+    // the speculative init_time; without this gate the throttle's deadlock-avoidance timeout below
+    // lets DL emit slot indications during that window and the scheduler slot counter ends up offset
+    // from the RX slot counter by a multiple of the request-pool depth -> every UL request is "late".
+    // On the first DL processing call, wait for the RX timeline to go live and re-anchor the DL
+    // timeline to it (once). The DL was seeded from a speculative init_time ~100 ms in the future of
+    // the real RX start (the radio may not honour a timed RX start); re-seeding it to
+    // first_rx + rx_to_tx_max_delay makes the DL/scheduler slot counter start exactly one lead-budget
+    // ahead of the RX slot counter, so the two agree and no UL request is spuriously late. Without
+    // this, the throttle's deadlock-avoidance timeout below lets DL emit slot indications during the
+    // ~100 ms settling window and the scheduler counter ends up offset from RX by a multiple of the
+    // request-pool depth -> every UL request is late (start-dependent UL storm).
+    if (!dl_reanchored.load(std::memory_order_acquire)) {
+      const auto rx_wait_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+      while (!rx_has_started.load(std::memory_order_acquire) &&
+             (std::chrono::steady_clock::now() < rx_wait_deadline)) {
+        std::this_thread::sleep_for(std::chrono::microseconds(50));
+      }
+      if (rx_has_started.load(std::memory_order_acquire) && !dl_reanchored.exchange(true)) {
+        const baseband_gateway_timestamp first_rx = first_rx_timestamp.load(std::memory_order_relaxed);
+        const baseband_gateway_timestamp anchored  = first_rx + rx_to_tx_max_delay;
+        std::printf("DL-REANCHOR: dl_ts %lld -> %lld (first_rx=%lld + budget=%lld)\n",
+                    (long long)timestamp, (long long)anchored, (long long)first_rx,
+                    (long long)rx_to_tx_max_delay);
+        std::fflush(stdout);
+        timestamp = anchored;
+      }
+    }
     // Calculate maximum waiting time to avoid deadlock.
     std::chrono::microseconds timeout_duration = 2 * slot_duration;
     // Maximum time point to wait for.
@@ -153,6 +183,14 @@ void lower_phy_baseband_processor::ul_process()
 
   // Update last timestamp.
   last_rx_timestamp.store(rx_metadata.ts + rx_buffer->get_nof_samples(), std::memory_order_release);
+
+  // The first RX buffer has been received: the RX timeline is live. Until this point the DL must not
+  // advance (see dl_process), otherwise the scheduler produces slot indications ahead of a not-yet-
+  // started RX and its slot counter ends up permanently offset from the RX slot counter.
+  if (!rx_has_started.load(std::memory_order_acquire)) {
+    first_rx_timestamp.store(rx_metadata.ts, std::memory_order_relaxed);
+    rx_has_started.store(true, std::memory_order_release);
+  }
 
   // Queue uplink buffer processing.
   report_fatal_error_if_not(uplink_executor.defer([this, ul_buffer = std::move(rx_buffer), rx_metadata]() mutable {
