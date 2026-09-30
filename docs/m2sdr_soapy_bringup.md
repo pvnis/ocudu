@@ -328,40 +328,24 @@ all (2 µs is well inside the PRACH detection window); the constant goes into th
 
 ### 8.4 Still to watch
 
-* **Start-dependent UL real-time storm — ROOT-CAUSED AND FIXED (2026-09-30).** On a fraction of
-  starts the gNB used to fall into `PUxCH request late` ~100/s + `UL processor is busy` up to 600/s,
-  with the phone registered but the UL dead. Instrumentation nailed it:
-  - The lower-PHY **RX slot counter** is derived from the real hardware RX timestamps; the
-    **scheduler/DL slot counter** is driven by DL slot indications seeded from a speculative
-    `init_time = current_time + 100 ms` (the no-PPS branch of `ru_controller_sdr_impl::start()`).
-  - The M2SDR Soapy RX stream does **not** honour a timed start ("timing not supported, starting
-    immediately"), so RX actually begins ~100 ms (~190 slots) *before* `init_time`. The DL was thus
-    seeded ~190 slots ahead of where RX really starts (confirmed: `EPOCH-DL` first `dl_process` ts was
-    always ~2.2 M samples / 95 ms beyond `EPOCH-RX` first `rx_metadata.ts`).
-  - During the ~100 ms settling window the DL throttle's **2-slot deadlock-avoidance timeout** lets DL
-    emit slot indications while RX has not started, advancing the scheduler ahead of RX. How many
-    escapes fire (setup-speed dependent) decides clean vs storm — hence the intermittency.
-  - The lower-PHY **PUxCH request pool has exactly 64 entries**. When the residual scheduler-vs-RX slot
-    offset lands on a **multiple of 64**, every UL request parks at the right pool index but with a
-    slot label the RX consumer never matches → 100 % "late" forever (observed `PUXCH-DIAG` deltas were
-    always multiples of 64: 64/128/192/448/640/768). The DL-to-RX *time* gap stayed a healthy 10 slots
-    throughout (`DL-GAP-DIAG escaped=0`), proving it was a slot-*number* misalignment, not a runaway.
-  - **Fix** (`lower_phy_baseband_processor`): on the first `dl_process`, wait for the first RX buffer
-    and **re-anchor the DL timeline to `first_rx_timestamp + rx_to_tx_max_delay`**. The DL/scheduler
-    then starts exactly one lead-budget ahead of the real RX start, so the counters agree and no UL
-    request is spuriously late. Verified over many cold restarts: PUxCH-late drops to a ~100-200
-    startup transient with no persistent storm (was thousands on ~1/3-1/2 of starts).
-  - `guardian_hw.sh` keeps the storm restart guard as a belt-and-braces safety net.
-  - **Runtime re-trigger (found after the fix).** With the start race fixed, a run stayed clean for
-    ~8 s, then a single host stall — `[MAC] Skipped slot indication ... DL task queue is full` (2
-    slots) → `late DL_TTI.request` — re-opened the *same* 64-aliasing misalignment and locked into a
-    permanent 20 000+/min UL-busy storm. The misalignment never self-corrects, at start or mid-run.
-    The stall source here is **DRM KMS connector polling** (`/sys/module/drm_kms_helper/parameters/poll
-    = Y`), which the gNB explicitly warns about; disabling it (`echo N | sudo tee
-    /sys/module/drm_kms_helper/parameters/poll`, done in `guardian_hw.sh`, resets on reboot) removed
-    the stalls and the gNB ran clean for minutes with the phone's UL alive. A fully robust fix would
-    re-anchor on any detected mid-run slot discontinuity; disabling the stall source is the pragmatic
-    cure since the misalignment is only ever seeded by a stall.
+* **UL real-time storm — root cause: RX timestamps that were not sample-exact (fixed in the m2sdr
+  driver, 2026-09-30).** On about half of the starts the gNB fell into `PUxCH request late` +
+  `UL processor is busy` (every UL slot), phone registered but UL dead. The cause:
+  - The plugin labelled each RX DMA frame with the FPGA's nanosecond stamp. Those stamps carry
+    quantisation noise, so after `round(ns × fs / 1e9)` consecutive blocks were sometimes not
+    contiguous: **±1 sample, 2000–3000 times per second**, or never — it depends on the sub-sample
+    phase the run happens to start with.
+  - `lower_phy_uplink_processor_impl::process_collecting` treats any timestamp mismatch as "alignment
+    lost" and discards RX up to the next subframe boundary. The UL requests for the discarded slots are
+    never consumed (found 64 slots later → "late"), their grids stay referenced ("UL processor is busy").
+  - Evidence (8 starts, stock lower PHY): 4 starts with 0 non-contiguous labels → 0 lates; 4 starts with
+    42k–66k ±1 jumps in 22 s → storm. After the driver fix: 8/8 starts with 0 jumps and 0 lates.
+  - **Earlier explanations in this document's history were wrong or incidental:** the DL re-anchor patch
+    in `lower_phy_baseband_processor` (commit fbd2432be0) and disabling DRM KMS polling coincided with
+    clean runs that were really lucky sample phases. The re-anchor and all diagnostics have been removed
+    from the OCUDU core again. `guardian_hw.sh` still disables DRM KMS polling (the gNB recommends it)
+    and still restarts on storms, as a safety net only.
+  - The fix lives in the radio, where a USRP has it too (§8.5).
 
 * Genuine host stalls (> TX lead of 4.8 ms) still cost DL frames (dropped as late, silence) and a
   burst restart in OCUDU; that is the intended USRP-like behaviour, but the stall itself is the host's
@@ -371,3 +355,27 @@ all (2 µs is well inside the PRACH detection window); the constant goes into th
   `1 µs / ε` seconds (DAC slow); no drift was observed over 10 minutes.
 * The loopback test in m2sdr cannot measure the release offset (RX time freezes while TX holds); the
   46 samples are an over-the-air number for this board and rate.
+
+### 8.5 What the radio now provides (the UHD contract), so that OCUDU core stays stock
+
+OCUDU's lower PHY silently relies on three properties that UHD radios have. The M2SDR driver/gateware
+(branch `hw-timed-tx`, gateware v5) now provides them; details in `~/m2sdr/doc/timed_tx_hw.md`.
+
+| Property | UHD | M2SDR now |
+|---|---|---|
+| Sample-exact, contiguous timestamps | time specs are ticks of the sample clock | RX frames are labelled by counting samples from an anchor; the FPGA stamp only detects real gaps |
+| Timed RX start | `issue_stream_cmd(time_spec, stream_now=false)` | FPGA `timed_rx_start` gate; the first frame is the requested tick |
+| Bounded, back-pressured TX FIFO | flow-controlled `send()` | `tx_fifo_buffers` (default 96 = 8.5 ms); the Soapy adapter waits like the UHD adapter |
+| Timed TX | FPGA holds bursts until their tick | `timed_tx` gate (§8.1) |
+
+With `time_base=samples` in `device_args` every SoapySDR "timeNs" value exchanged with the plugin is a
+sample count, so there is no nanosecond conversion anywhere between the lower PHY and the radio
+(`lib/radio/soapy`: `soapy_time_in_samples`, `soapy_samples_to_api`, `soapy_api_to_samples`).
+
+At start the DL now runs 27–28 slots ahead of RX (5 ms budget + FIFO) instead of 177–194, and the first
+RX label equals `init_time`.
+
+Remaining OCUDU core deltas for this radio: `lower_phy_factory.cpp` (`OCUDU_LPHY_RX_TO_TX_DELAY_US`,
+RX buffer floor) and `resource_request_pool.h` (64 entries). They exist because frames must reach the
+FPGA ~1 ms before their time and RX is delivered with up to 0.7 ms lag (one IRQ per 8 DMA buffers); the
+stock 1 ms budget needs that RX latency reduced first.

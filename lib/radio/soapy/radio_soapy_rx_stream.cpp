@@ -20,7 +20,7 @@ static constexpr unsigned DEVICE_SAMPLE_SHIFT = 4;
 
 static inline long long samples_to_ns(uint64_t samples, double srate_hz)
 {
-  return static_cast<long long>(static_cast<double>(samples) * 1e9 / srate_hz);
+  return soapy_samples_to_api(samples, srate_hz);
 }
 
 radio_soapy_rx_stream::radio_soapy_rx_stream(radio_soapy_device&       device_,
@@ -274,14 +274,17 @@ baseband_gateway_receiver::metadata radio_soapy_rx_stream::receive(baseband_gate
     if (!timestamp_captured) {
       if (flags & SOAPY_SDR_HAS_TIME) {
         const long long first_time_ns =
-            time_ns + static_cast<long long>((static_cast<double>(source_offset) * 1e9) / srate_hz);
+            time_ns + soapy_samples_to_api(source_offset, srate_hz);
         last_time_ns       = first_time_ns;
         timestamp_captured = true;
         time_ns            = first_time_ns;
-        ret.ts             = static_cast<baseband_gateway_timestamp>(std::llround(time_ns * srate_hz / 1e9) + rx_ts_shift);
+        ret.ts             = static_cast<baseband_gateway_timestamp>(soapy_api_to_samples(time_ns, srate_hz) + rx_ts_shift);
         // Diagnostic: the hardware timestamp should continue exactly where the previous call ended.
         if (last_sample_ts_valid && rxd_total == 0) {
           const int64_t jump = static_cast<int64_t>(ret.ts) - static_cast<int64_t>(last_sample_ts);
+          if (jump != 0) {
+            ++rx_ts_small_jumps; // any non-contiguous label, including the +-1 rounding ones
+          }
           if (jump > 2 || jump < -2) { // +-1..2 samples is ns-to-sample rounding jitter of the plugin timestamps
             ++rx_ts_jumps;
             logger.warning("Soapy RX: hardware timestamp discontinuity of {} samples ({:+.1f} us), overflows in call={}, total jumps={}.",
@@ -297,7 +300,7 @@ baseband_gateway_receiver::metadata radio_soapy_rx_stream::receive(baseband_gate
         if (last_sample_ts_valid) {
           ret.ts = last_sample_ts;
         } else {
-          ret.ts = static_cast<baseband_gateway_timestamp>(std::llround(time_ns * srate_hz / 1e9) + rx_ts_shift);
+          ret.ts = static_cast<baseband_gateway_timestamp>(soapy_api_to_samples(time_ns, srate_hz) + rx_ts_shift);
         }
       }
     }
@@ -337,7 +340,7 @@ baseband_gateway_receiver::metadata radio_soapy_rx_stream::receive(baseband_gate
     if (timestamp_captured && std::isnormal(srate_hz)) {
       last_sample_ts = ret.ts + rxd_total;
       last_sample_ts_valid = true;
-      last_time_ns = static_cast<long long>(std::llround(static_cast<double>(last_sample_ts) * 1e9 / srate_hz));
+      last_time_ns = soapy_samples_to_api(last_sample_ts, srate_hz);
     }
   }
 
@@ -377,7 +380,7 @@ baseband_gateway_receiver::metadata radio_soapy_rx_stream::receive(baseband_gate
     rx_lag_counter = 0;
     long long hw_now = 0;
     if (device.get_hardware_time(hw_now)) {
-      fmt::print("Soapy RX lag: {} us behind hardware time.\n", (hw_now - samples_to_ns(ret.ts + rxd_total - rx_ts_shift, srate_hz)) / 1000);
+      fmt::print("Soapy RX lag: {} us behind hardware time. non-contiguous labels so far: {} (of which >2 samples: {}).\n", soapy_api_to_ns(hw_now - samples_to_ns(ret.ts + rxd_total - rx_ts_shift, srate_hz), srate_hz) / 1000, rx_ts_small_jumps, rx_ts_jumps);
     }
   }
 
@@ -396,7 +399,7 @@ baseband_gateway_receiver::metadata radio_soapy_rx_stream::receive(baseband_gate
       bool      hw_ok     = false;
       if (device.get_hardware_time(hw_now_ns)) {
         const long long ret_time_ns = samples_to_ns(ret.ts, srate_hz);
-        lag_us = (hw_now_ns - ret_time_ns) / 1000;
+        lag_us = soapy_api_to_ns(hw_now_ns - ret_time_ns, srate_hz) / 1000;
         hw_ok  = true;
       }
       logger.info("Soapy RX receive: nsamples={} mtu={} loops={} overflows={} dt={}us ts={} dts={} hw_now_ns={} "

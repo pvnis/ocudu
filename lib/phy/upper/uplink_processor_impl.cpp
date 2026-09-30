@@ -81,14 +81,7 @@ void uplink_processor_impl::stop()
 unique_uplink_pdu_slot_repository uplink_processor_impl::get_pdu_slot_repository(slot_point slot)
 {
   // It is not possible to configure a new slot if the resource grid is still present in a scope.
-  if (unsigned refs = grid_ref_counter.load(std::memory_order_acquire); refs != 0) {
-    // Diagnostic (rate limited): who holds the grid decides whether this is a transient (lower PHY request still
-    // parked) or a leak.
-    if (++busy_diag_count % 512 == 1) {
-      logger.warning(slot.sfn(), slot.slot_index(),
-                     "UL processor busy: grid of slot {} still referenced {} time(s), fsm=0x{:08x} (occurrence {}).",
-                     current_slot, refs, state_machine.get_raw_state(), busy_diag_count);
-    }
+  if (grid_ref_counter.load(std::memory_order_acquire) != 0) {
     return {};
   }
 
@@ -97,11 +90,6 @@ unique_uplink_pdu_slot_repository uplink_processor_impl::get_pdu_slot_repository
 
   // Try to configure a new slot.
   if (!state_machine.start_new_slot(slot)) {
-    if (++busy_diag_count % 512 == 1) {
-      logger.warning(slot.sfn(), slot.slot_index(),
-                     "UL processor busy: FSM not idle for slot {}, fsm=0x{:08x} (occurrence {}).",
-                     current_slot, state_machine.get_raw_state(), busy_diag_count);
-    }
     // Return an invalid repository.
     return {};
   }

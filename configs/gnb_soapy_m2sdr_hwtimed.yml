@@ -15,7 +15,7 @@ cu_cp:
 
 ru_sdr:
   device_driver: soapy
-  device_args: driver=LiteXM2SDR,ad9361_fir_profile=bypass,rx_worker_packets=2048,freq_corr_ppm=1.327,timed_tx=hardware
+  device_args: driver=LiteXM2SDR,ad9361_fir_profile=bypass,rx_worker_packets=2048,freq_corr_ppm=1.327,timed_tx=hardware,time_base=samples
   srate: 23.04
   tx_gain: -10             # = 10 dB attenuation on the M2SDR
   rx_gain: 40

@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <cmath>
+
 #include "radio_soapy_exception_handler.h"
 #include "ocudu/ocudulog/ocudulog.h"
 #include "fmt/chrono.h"
@@ -30,6 +32,42 @@ inline std::atomic<unsigned> soapy_debug_dump_generation{0};
 /// timestamps handed to the lower PHY, keeping the stream continuous (drops samples for a negative shift, inserts
 /// zeros for a positive one). This compensates the M2SDR software-timed TX offset measured after start-up.
 inline std::atomic<unsigned> soapy_rx_ts_shift_generation{0};
+
+/// \brief Unit of every SoapySDR "timeNs" value exchanged with the device.
+///
+/// SoapySDR specifies nanoseconds. With the device argument \c time_base=samples (LiteX-M2SDR plugin) the same
+/// parameters carry sample counts instead, so timestamps go between the lower PHY and the radio without any
+/// nanosecond conversion -- like UHD, whose time specs are exact ticks of the sample clock. Nanoseconds at 23.04 MSps
+/// (43.4 ns per sample) cannot represent a sample index exactly, and double-precision conversions lose integer
+/// precision once the device time exceeds 2^53 ns (104 days).
+inline std::atomic<bool> soapy_time_in_samples{false};
+
+/// Converts a sample count into the device time unit.
+inline long long soapy_samples_to_api(uint64_t samples, double srate_hz)
+{
+  if (soapy_time_in_samples.load(std::memory_order_relaxed)) {
+    return static_cast<long long>(samples);
+  }
+  return static_cast<long long>(static_cast<double>(samples) * 1e9 / srate_hz);
+}
+
+/// Converts a device time (or a difference of two) into a sample count.
+inline long long soapy_api_to_samples(long long api_time, double srate_hz)
+{
+  if (soapy_time_in_samples.load(std::memory_order_relaxed)) {
+    return api_time;
+  }
+  return std::llround(static_cast<double>(api_time) * srate_hz / 1e9);
+}
+
+/// Converts a device time (or a difference of two) into nanoseconds, for host-side timeouts and prints.
+inline long long soapy_api_to_ns(long long api_time, double srate_hz)
+{
+  if (soapy_time_in_samples.load(std::memory_order_relaxed)) {
+    return static_cast<long long>(static_cast<double>(api_time) * 1e9 / srate_hz);
+  }
+  return api_time;
+}
 
 class radio_soapy_device : public soapy_exception_handler
 {

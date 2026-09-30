@@ -100,6 +100,13 @@ radio_session_soapy_impl::radio_session_soapy_impl(const radio_configuration::ra
   // Open the SoapySDR device.
   {
     const SoapySDR::Kwargs dev_kwargs = SoapySDR::KwargsFromString(radio_config.args);
+    {
+      const auto tb = dev_kwargs.find("time_base");
+      soapy_time_in_samples.store(tb != dev_kwargs.end() && (tb->second == "samples" || tb->second == "ticks"));
+      if (soapy_time_in_samples.load()) {
+        fmt::print("SoapySDR: device time is exchanged in samples (time_base=samples), no nanosecond conversion.\n");
+      }
+    }
     if (auto it = dev_kwargs.find("freq_corr_ppm"); it != dev_kwargs.end()) {
       freq_corr_ppm = std::stod(it->second);
       fmt::print("SoapySDR: applying LO frequency correction of {:+.3f} ppm.\n", freq_corr_ppm);
@@ -260,7 +267,7 @@ void radio_session_soapy_impl::start(baseband_gateway_timestamp init_time)
   }
 
   // Activate RX streams with the initial timestamp.
-  const long long init_time_ns = static_cast<long long>(static_cast<double>(init_time) * 1e9 / actual_sampling_rate_Hz);
+  const long long init_time_ns = soapy_samples_to_api(init_time, actual_sampling_rate_Hz);
   for (auto& gateway : bb_gateways) {
     if (!gateway->get_rx_stream().start(init_time_ns)) {
       fmt::print("Error: failed to start RX stream.\n");
@@ -353,7 +360,7 @@ baseband_gateway_timestamp radio_session_soapy_impl::read_current_time()
     return 0;
   }
 
-  return static_cast<baseband_gateway_timestamp>(static_cast<double>(time_ns) * actual_sampling_rate_Hz / 1e9);
+  return static_cast<baseband_gateway_timestamp>(soapy_api_to_samples(time_ns, actual_sampling_rate_Hz));
 }
 
 // ---------------------------------------------------------------------------

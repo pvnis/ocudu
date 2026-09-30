@@ -200,9 +200,6 @@ private:
   internal_fsm                                                               tx_state;
   internal_fsm                                                               rx_state;
   std::atomic<baseband_gateway_timestamp>                                    last_rx_timestamp;
-  std::atomic<bool>                                                          rx_has_started{false};
-  std::atomic<baseband_gateway_timestamp>                                    first_rx_timestamp{0};
-  std::atomic<bool>                                                          dl_reanchored{false};
   std::optional<std::chrono::time_point<std::chrono::high_resolution_clock>> last_tx_time;
   unsigned                                                                   last_tx_buffer_size = 0;
 };

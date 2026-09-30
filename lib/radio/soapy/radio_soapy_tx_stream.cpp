@@ -12,8 +12,21 @@
 
 using namespace ocudu;
 
-/// Maximum number of consecutive writeStream timeouts tolerated for a single transmission.
-static constexpr unsigned MAX_WRITE_TIMEOUT_RETRIES = 100;
+/// Maximum time a single transmission keeps retrying writeStream timeouts. A timeout is back-pressure from the
+/// device TX FIFO (samples queued that are not due yet); like the UHD adapter, which loops on send() until all
+/// samples are accepted, the downlink thread must wait here rather than drop the block. Bounded so a dead device
+/// cannot hang the thread forever (OCUDU_SOAPY_TX_MAX_BLOCK_MS overrides it).
+static std::chrono::milliseconds max_write_block()
+{
+  static const std::chrono::milliseconds value = []() {
+    long ms = 2000;
+    if (const char* env = std::getenv("OCUDU_SOAPY_TX_MAX_BLOCK_MS")) {
+      ms = std::max(1L, std::strtol(env, nullptr, 10));
+    }
+    return std::chrono::milliseconds(ms);
+  }();
+  return value;
+}
 
 /// Async status poll timeout in microseconds (1 ms).
 static constexpr long RECV_ASYNC_TIMEOUT_US = 1000;
@@ -34,7 +47,7 @@ static inline int16_t to_device_sample(int16_t value)
 /// Samples-to-nanoseconds helper.
 static inline long long samples_to_ns(uint64_t samples, double srate_hz)
 {
-  return static_cast<long long>(static_cast<double>(samples) * 1e9 / srate_hz);
+  return soapy_samples_to_api(samples, srate_hz);
 }
 
 radio_soapy_tx_stream::radio_soapy_tx_stream(radio_soapy_device&       device_,
@@ -121,11 +134,11 @@ void radio_soapy_tx_stream::recv_async_msg()
 
   if (ret == SOAPY_SDR_TIME_ERROR) {
     event.type            = radio_event_type::LATE;
-    event.timestamp       = static_cast<uint64_t>(time_ns * srate_hz / 1e9);
-    state_fsm.async_event_late_underflow(time_ns);
+    event.timestamp       = static_cast<uint64_t>(soapy_api_to_samples(time_ns, srate_hz));
+    state_fsm.async_event_late_underflow(soapy_api_to_ns(time_ns, srate_hz));
   } else if (ret == SOAPY_SDR_UNDERFLOW) {
     event.type            = radio_event_type::UNDERFLOW;
-    state_fsm.async_event_late_underflow(time_ns);
+    state_fsm.async_event_late_underflow(soapy_api_to_ns(time_ns, srate_hz));
   }
   // ret == 0 is timeout (no event) — ignore.
 
@@ -168,9 +181,9 @@ void radio_soapy_tx_stream::transmit(const baseband_gateway_buffer_reader&      
   int  flags    = 0;
   bool transmit = false;
   if (discontinuous_tx) {
-    transmit = state_fsm.on_transmit(flags, time_ns, tx_md.is_empty, tx_end_padding);
+    transmit = state_fsm.on_transmit(flags, soapy_api_to_ns(time_ns, srate_hz), tx_md.is_empty, tx_end_padding);
   } else {
-    transmit = state_fsm.on_transmit(flags, time_ns, false, false);
+    transmit = state_fsm.on_transmit(flags, soapy_api_to_ns(time_ns, srate_hz), false, false);
   }
 
   if (!transmit) {
@@ -186,12 +199,12 @@ void radio_soapy_tx_stream::transmit(const baseband_gateway_buffer_reader&      
                                 .channel_id = 0,
                                 .source     = radio_event_source::TRANSMIT,
                                 .type       = radio_event_type::START_OF_BURST,
-                                .timestamp  = static_cast<uint64_t>(time_ns * srate_hz / 1e9)});
+                                .timestamp  = static_cast<uint64_t>(soapy_api_to_samples(time_ns, srate_hz))});
 
     // Transmit power-ramping zeros before the burst.
     if (discontinuous_tx && power_ramping_nof_samples > 0) {
       const unsigned tx_gap_samples =
-          static_cast<unsigned>((time_ns - last_tx_time_ns) * srate_hz / 1e9);
+          static_cast<unsigned>(soapy_api_to_samples(time_ns - last_tx_time_ns, srate_hz));
       const unsigned min_gap = static_cast<unsigned>(srate_hz / 100000.0); // 10 µs
 
       if (tx_gap_samples > min_gap) {
@@ -229,7 +242,7 @@ void radio_soapy_tx_stream::transmit(const baseband_gateway_buffer_reader&      
                                 .channel_id = 0,
                                 .source     = radio_event_source::TRANSMIT,
                                 .type       = radio_event_type::END_OF_BURST,
-                                .timestamp  = static_cast<uint64_t>(time_ns * srate_hz / 1e9)});
+                                .timestamp  = static_cast<uint64_t>(soapy_api_to_samples(time_ns, srate_hz))});
   }
 
   // Determine the sample range within the buffer.
@@ -305,13 +318,14 @@ void radio_soapy_tx_stream::transmit(const baseband_gateway_buffer_reader&      
     tx_lead_counter = 0;
     long long hw_now = 0;
     if (device.get_hardware_time(hw_now)) {
-      fmt::print("Soapy TX lead: stamps are {} us ahead of hardware time.\n", (time_ns - hw_now) / 1000);
+      fmt::print("Soapy TX lead: stamps are {} us ahead of hardware time.\n", soapy_api_to_ns(time_ns - hw_now, srate_hz) / 1000);
     }
   }
 
   unsigned sent_total      = 0;
   unsigned chunks          = 0;
-  unsigned timeout_retries = 0;
+  unsigned   timeout_retries = 0;
+  const auto block_deadline  = std::chrono::steady_clock::now() + max_write_block();
   while (sent_total < data_nof_samples) {
     std::array<const void*, RADIO_MAX_NOF_CHANNELS> rd_buffs = {};
     const unsigned remaining = data_nof_samples - sent_total;
@@ -331,7 +345,8 @@ void radio_soapy_tx_stream::transmit(const baseband_gateway_buffer_reader&      
       if (ret == SOAPY_SDR_TIMEOUT || ret == 0) {
         // A timeout is backpressure from a full TX ring, not an error. Retry until the stream is stopped or the wait
         // exceeds the maximum, since dropping samples would break the continuous TX timeline.
-        if (!token.is_stop_requested() && ++timeout_retries <= MAX_WRITE_TIMEOUT_RETRIES) {
+        ++timeout_retries;
+        if (!token.is_stop_requested() && std::chrono::steady_clock::now() < block_deadline) {
           continue;
         }
         logger.warning("SoapySDR TX: writeStream timed out {} times ({} us each) for stream {}.",
@@ -358,7 +373,7 @@ void radio_soapy_tx_stream::transmit(const baseband_gateway_buffer_reader&      
       long long lead_us   = 0;
       bool      hw_ok     = false;
       if (device.get_hardware_time(hw_now_ns)) {
-        lead_us = (time_ns - hw_now_ns) / 1000;
+        lead_us = soapy_api_to_ns(time_ns - hw_now_ns, srate_hz) / 1000;
         hw_ok   = true;
       }
       logger.info("Soapy TX trace: stream={} samples={} chunks={} flags=0x{:x} ts={} empty={} dt={}us hw_now_ns={} "
