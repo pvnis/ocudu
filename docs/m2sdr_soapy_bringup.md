@@ -282,3 +282,57 @@ which qcore declines with a 5GMM Status — harmless.
    10000000000000000000`, reset by reboot); it camps and registers on 001-01 by itself. After
    several failed attempts it bars the cell for 300 s; a SIM reinsert or network-settings reset
    clears the forbidden-PLMN state.
+
+## 8. Hardware-timed TX (m2sdr branch `hw-timed-tx`, 2026-09-30)
+
+The work-around of §3.4 exists because the `working-ue` plugin emits DL samples whenever the DMA ring
+reaches them, at an offset from their stamps that is random per start and moves on every re-anchor.
+The `hw-timed-tx` branch of m2sdr adds a **timed-TX gate** to the FPGA: every 8 KiB DMA frame carries
+a 16-byte header (sync word + 64-bit board-time stamp in ns of the frame's first sample); the gate
+holds the frame until `time_gen` reaches the stamp, passes it, or drops it when it is late. Design and
+the full list of findings: `~/m2sdr/doc/timed_tx_hw.md`.
+
+### 8.1 Result
+
+With `timed_tx=hardware` in `device_args` (`configs/gnb_soapy_m2sdr_hwtimed.yml`) the RX-minus-TX SSB
+offset measured by `align.py` is **45–46 samples on every dump generation and on every restart** (three
+cold starts, >30 generations). Gate counters while OCUDU streams: `held == passed == 11272 frames/s`
+(every frame waits for its stamp), `late == 0`. The phone registered on PCI 101 with no RX shift at
+all (2 µs is well inside the PRACH detection window); the constant goes into the configuration once:
+`OCUDU_SOAPY_RX_TS_SHIFT=-46` (new env knob, §8.3).
+
+### 8.2 What it took (all on the plugin/libm2sdr side; see the m2sdr doc for details)
+
+* Bypass the DMA synchronizer's PPS wait in hardware mode (the TX stream otherwise starts up to 1 s
+  after activation, with every frame already late).
+* Zero the TX ring at activation and keep the write pointer 4 slots past the DMA reader's *live* table
+  index: the reader free-runs and prefetches, and a frame written behind it is emitted a lap later
+  (late → dropped). A larger lead makes the frame after every hold late → the ring thrashes.
+* Exact timeline arithmetic for the untimed writes that follow a start-of-burst (OCUDU stamps only the
+  first write of a burst): the per-chunk `llround` accumulated ~1 ppm, i.e. the offset ramped
+  ~20 samples/s until the burst restarted.
+* Late margin 1 µs: an in-margin late frame leaves its lateness as a permanent fill level in the TX
+  pipeline; with the one-MTU default the offset settled anywhere within a frame.
+* Stale ring re-reads (drops older than half a lap) are counted separately and **not** reported as
+  `TIME_ERROR`: OCUDU ends the burst on every late report and the resulting gap produces the next
+  stale sweep — a self-sustaining storm after any host stall (§3.5's "storms" have this shape).
+
+### 8.3 What changed in OCUDU for this mode
+
+* `lib/radio/soapy/radio_soapy_rx_stream.cpp`: `OCUDU_SOAPY_RX_TS_SHIFT=<samples>` sets the RX
+  timestamp shift statically at start (the `/tmp/ocudu_soapy_rx_ts_shift` + `SIGUSR2` mechanism of
+  §3.4 still works on top).
+* `configs/gnb_soapy_m2sdr_hwtimed.yml`: the n78 configuration with `timed_tx=hardware`.
+* `scripts/m2sdr/guardian_hw.sh`: guardian for this mode — no `align.py` loop, no shift juggling;
+  restarts the gNB on PUxCH-late storms or when the gate drops the host's frames, watches the phone.
+
+### 8.4 Still to watch
+
+* Genuine host stalls (> TX lead of 4.8 ms) still cost DL frames (dropped as late, silence) and a
+  burst restart in OCUDU; that is the intended USRP-like behaviour, but the stall itself is the host's
+  (§3.5).
+* The DAC sample clock and `time_gen` are different oscillators. With every frame re-pinned to its
+  stamp this shows up only as an occasional inserted zero sample (DAC fast) or a dropped frame every
+  `1 µs / ε` seconds (DAC slow); no drift was observed over 10 minutes.
+* The loopback test in m2sdr cannot measure the release offset (RX time freezes while TX holds); the
+  46 samples are an over-the-air number for this board and rate.

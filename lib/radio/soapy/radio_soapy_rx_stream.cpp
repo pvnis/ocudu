@@ -35,6 +35,13 @@ radio_soapy_rx_stream::radio_soapy_rx_stream(radio_soapy_device&       device_,
   if (const char* env = std::getenv("OCUDU_SOAPY_RX_TS_SHIFT_FILE")) {
     rx_ts_shift_file = env;
   }
+  if (const char* env = std::getenv("OCUDU_SOAPY_RX_TS_SHIFT")) {
+    // Static RX timestamp shift in samples (label = hardware + shift), for radios whose DL emission
+    // offset is a constant (hardware-timed TX): the RX-minus-TX offset measured once by align.py,
+    // negated. The runtime file/SIGUSR2 mechanism still applies on top.
+    rx_ts_shift = std::strtoll(env, nullptr, 10);
+    fmt::print("Soapy RX: static timestamp shift {} samples (OCUDU_SOAPY_RX_TS_SHIFT).\n", rx_ts_shift);
+  }
   if (const char* env = std::getenv("OCUDU_SOAPY_RX_DUMP")) {
     // Skip OCUDU_SOAPY_RX_DUMP_SKIP_S seconds (2 s by default), then capture OCUDU_SOAPY_RX_DUMP_MS milliseconds (100 ms by default).
     double dump_ms = 100.0;
