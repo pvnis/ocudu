@@ -20,12 +20,12 @@ start_gnb(){
   sleep 20; log "gNB started (shift $SHIFT): $(pgrep -x gnb >/dev/null && echo up || echo FAILED)"
 }
 rm -f $STOP; log "guardian_hw start"; start_gnb
-last_reg=""; last_puxch=0; last_late=$((16#$(reg 0x15808 | cut -c3-))); last_health=$(date +%s)
+last_reg=""; last_puxch=0; last_late=$((16#$(reg 0x1580c | cut -c3-))); last_health=$(date +%s)
 while [ ! -f $STOP ]; do
   sleep 30
   if ! pgrep -x gnb >/dev/null; then log "gNB died -> restart"; start_gnb; continue; fi
   puxch=$(grep -ac "PUxCH request late" /tmp/gnb.log 2>/dev/null); rflate=$(grep -ac "RF: late" /tmp/gnb.log 2>/dev/null)
-  late=$((16#$(reg 0x15808 | cut -c3-))); dl=$(( late - last_late )); last_late=$late
+  late=$((16#$(reg 0x1580c | cut -c3-))); dl=$(( late - last_late )); last_late=$late
   dp=$(( puxch - last_puxch )); last_puxch=$puxch
   reg_state=$(A shell dumpsys telephony.registry | grep -m1 -o -E "registrationState=[A-Z_]+" | cut -d= -f2)
   [ "$reg_state" != "$last_reg" ] && { log "phone: $reg_state (PUxCH-late +$dp, gate late +$dl, RF late total $rflate)"; last_reg=$reg_state; }
