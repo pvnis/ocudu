@@ -197,6 +197,9 @@ private:
   // See uplink_slot_processor interface for documentation.
   void discard_slot() override;
 
+  /// Counter of rejected slot configurations, for rate-limited diagnostics.
+  unsigned busy_diag_count = 0;
+
   /// \brief Processes the physical layer PDUs associated to the received symbols.
   ///
   /// Retrieves the PDUs by which the last symbol in the allocation matches the given \c end_symbol_index and forwards

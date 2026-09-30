@@ -20,16 +20,18 @@ start_gnb(){
   sleep 20; log "gNB started (shift $SHIFT): $(pgrep -x gnb >/dev/null && echo up || echo FAILED)"
 }
 rm -f $STOP; log "guardian_hw start"; start_gnb
-last_reg=""; last_puxch=0; last_late=$((16#$(reg 0x1580c | cut -c3-))); last_health=$(date +%s)
+last_reg=""; last_puxch=0; last_busy=0; last_late=$((16#$(reg 0x1580c | cut -c3-))); last_health=$(date +%s)
 while [ ! -f $STOP ]; do
   sleep 30
   if ! pgrep -x gnb >/dev/null; then log "gNB died -> restart"; start_gnb; continue; fi
-  puxch=$(grep -ac "PUxCH request late" /tmp/gnb.log 2>/dev/null); rflate=$(grep -ac "RF: late" /tmp/gnb.log 2>/dev/null)
+  puxch=$(grep -ac "PUxCH request late" /tmp/gnb.log 2>/dev/null); rflate=$(grep -ac "RF: late" /tmp/gnb.log 2>/dev/null); busy=$(grep -ac "UL processor is busy" /tmp/gnb.log 2>/dev/null)
   late=$((16#$(reg 0x1580c | cut -c3-))); dl=$(( late - last_late )); last_late=$late
-  dp=$(( puxch - last_puxch )); last_puxch=$puxch
+  dp=$(( puxch - last_puxch )); last_puxch=$puxch; db=$(( busy - last_busy )); last_busy=$busy
   reg_state=$(A shell dumpsys telephony.registry | grep -m1 -o -E "registrationState=[A-Z_]+" | cut -d= -f2)
   [ "$reg_state" != "$last_reg" ] && { log "phone: $reg_state (PUxCH-late +$dp, gate late +$dl, RF late total $rflate)"; last_reg=$reg_state; }
   # Unhealthy: sustained PUxCH-late storm or the gate dropping the host's frames.
-  if [ "$dp" -gt 2000 ] || [ "$dl" -gt 500 ]; then log "unhealthy: PUxCH-late +$dp/30s, gate late +$dl/30s -> restart"; start_gnb; fi
+  # "UL processor is busy" at a sustained rate = the UL PDU slot repositories are jammed (never released after
+  # a late request at start); the UL is dead even though the phone stays registered.
+  if [ "$dp" -gt 2000 ] || [ "$dl" -gt 500 ] || [ "$db" -gt 1500 ]; then log "unhealthy: PUxCH-late +$dp/30s, UL-busy +$db/30s, gate late +$dl/30s -> restart"; start_gnb; fi
 done
 log "guardian_hw stopped"

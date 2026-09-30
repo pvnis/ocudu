@@ -328,6 +328,20 @@ all (2 µs is well inside the PRACH detection window); the constant goes into th
 
 ### 8.4 Still to watch
 
+* **Start-dependent UL real-time storm (both timing modes, pre-existing, §3.5).** On roughly one start
+  in three the gNB enters a state with `PUxCH request late` at ~100/s and `UL processor is busy` at
+  up to 600/s (every UL slot); the phone may still register but the UL is dead (ping 100 % loss).
+  A/B on 2026-09-30 03:54–04:00: hardware-timed starts clean/clean/storm, software-timed start storm
+  (no phone attached) — so it is not caused by the gate. The added diagnostic in
+  `uplink_processor_impl::get_pdu_slot_repository` shows the rejected repository always as
+  "grid of slot N still referenced 1 time, fsm idle": the lower PHY's PUxCH request pool still holds
+  the grid of a *late* request (a request is only exchanged out when RX reaches the same pool index,
+  64 slots later), so each late request blocks its UL processor for ~28 ms, and in a storm the
+  requests are late continuously. Why the requests become systematically late on some starts is not
+  understood yet (the SCHED's slot in the "Discarding error indication" lines runs tens of slots ahead
+  of the late RX slot, which points at the MAC/lower-PHY slot timelines drifting apart at start).
+  `guardian_hw.sh` restarts on it (PUxCH-late > 2000/30 s or UL-busy > 1500/30 s).
+
 * Genuine host stalls (> TX lead of 4.8 ms) still cost DL frames (dropped as late, silence) and a
   burst restart in OCUDU; that is the intended USRP-like behaviour, but the stall itself is the host's
   (§3.5).

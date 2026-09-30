@@ -43,6 +43,9 @@ class uplink_processor_fsm : public uplink_processor_fsm_notifier
 public:
   /// \brief Starts accepting PDUs for the given slot.
   /// \return True if the transition from \e idle to <em>accepting PDUs</em> was successful, false otherwise.
+  /// Raw state word (pending PDU count and state masks), for diagnostics.
+  uint32_t get_raw_state() const { return pending_pdu_count.load(); }
+
   bool start_new_slot(slot_point slot)
   {
     uint32_t expected_pending_pdu_count = pending_pdu_count_idle;
