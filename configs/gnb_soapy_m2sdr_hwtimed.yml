@@ -1,4 +1,10 @@
-# gNB on LiteX-M2SDR via SoapySDR, TDD n78 20 MHz (3489.42 MHz), core = qcore on 127.0.0.1
+# gNB on LiteX-M2SDR via SoapySDR, TDD n78 20 MHz at 3600 MHz, core = qcore on 127.0.0.1:38412
+# Sample-timed variant (m2sdr branch hw-timed-tx, gateware v7): the FPGA counts samples in the RF clock
+# domain, stamps each RX frame with the index of its first sample and emits every TX sample at its index.
+# device_args timed_tx=hardware,time_base=samples: all times exchanged with the radio are sample counts.
+# The constant RX-minus-TX offset (42 samples, scripts/m2sdr/align.py) is applied once with
+# OCUDU_SOAPY_RX_TS_SHIFT=-42. Run through scripts/m2sdr/guardian_hw.sh (OCUDU_LPHY_RX_TO_TX_DELAY_US=5000);
+# see docs/m2sdr_soapy_bringup.md section 8.
 # Keep the carrier <= 40 MHz: the AD9361 analog filter tops out at 56 MHz.
 
 cu_cp:

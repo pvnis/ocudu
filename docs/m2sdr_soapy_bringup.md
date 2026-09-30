@@ -295,11 +295,19 @@ the full list of findings: `~/m2sdr/doc/timed_tx_hw.md`.
 ### 8.1 Result
 
 With `timed_tx=hardware` in `device_args` (`configs/gnb_soapy_m2sdr_hwtimed.yml`) the RX-minus-TX SSB
-offset measured by `align.py` is **45–46 samples on every dump generation and on every restart** (three
-cold starts, >30 generations). Gate counters while OCUDU streams: `held == passed == 11272 frames/s`
-(every frame waits for its stamp), `late == 0`. The phone registered on PCI 101 with no RX shift at
-all (2 µs is well inside the PRACH detection window); the constant goes into the configuration once:
-`OCUDU_SOAPY_RX_TS_SHIFT=-46` (new env knob, §8.3).
+offset measured by `align.py` is a constant. History of that constant:
+
+| Gateware | Time base | Offset |
+|---|---|---|
+| v3–v5 | `time_gen` nanoseconds, frame-level gate | 45–46 samples (±1 within and between runs) |
+| v6 | FPGA sample counter, per-word fine gate | 42 or 43, fixed within a run, chosen at each start |
+| v7 | same, TX word phase locked to RX | **42 samples on 9 of 9 cold starts** |
+
+Gate counters while OCUDU streams: `passed == 11272 frames/s`, `late == stale == 0`, fine gate
+`trimmed == 0`. The phone registers on PCI 101 even with no RX shift (2 µs is well inside the PRACH
+detection window); the constant goes into the configuration once: `OCUDU_SOAPY_RX_TS_SHIFT=-42` (env
+knob, §8.3). Measure with the phone silent (airplane mode): its uplink bursts swamp the SSB leak that
+`align.py` correlates on and the tool then prints garbage.
 
 ### 8.2 What it took (all on the plugin/libm2sdr side; see the m2sdr doc for details)
 
@@ -350,11 +358,12 @@ all (2 µs is well inside the PRACH detection window); the constant goes into th
 * Genuine host stalls (> TX lead of 4.8 ms) still cost DL frames (dropped as late, silence) and a
   burst restart in OCUDU; that is the intended USRP-like behaviour, but the stall itself is the host's
   (§3.5).
-* The DAC sample clock and `time_gen` are different oscillators. With every frame re-pinned to its
-  stamp this shows up only as an occasional inserted zero sample (DAC fast) or a dropped frame every
-  `1 µs / ε` seconds (DAC slow); no drift was observed over 10 minutes.
+* Since gateware v6 the timing path has a single clock (the sample counter in the RF domain), so the
+  earlier concern about `time_gen` and the sample clock being different oscillators no longer applies.
 * The loopback test in m2sdr cannot measure the release offset (RX time freezes while TX holds); the
-  46 samples are an over-the-air number for this board and rate.
+  42 samples are an over-the-air number for this board and rate.
+* qcore panicked once during a rapid gNB reconnect (`Option::unwrap()` on `None` in
+  `5g-libs/ngap/src/ies.rs:35063`); the gNB then cannot reach the AMF until qcore is restarted.
 
 ### 8.5 What the radio now provides (the UHD contract), so that OCUDU core stays stock
 
@@ -363,14 +372,16 @@ OCUDU's lower PHY silently relies on three properties that UHD radios have. The 
 
 | Property | UHD | M2SDR now |
 |---|---|---|
-| Sample-exact, contiguous timestamps | time specs are ticks of the sample clock | RX frames are labelled by counting samples from an anchor; the FPGA stamp only detects real gaps |
+| Sample-exact, contiguous timestamps | time specs are ticks of the sample clock | the FPGA counts samples in the RF clock domain and stamps each RX frame with the index of its first sample |
 | Timed RX start | `issue_stream_cmd(time_spec, stream_now=false)` | FPGA `timed_rx_start` gate; the first frame is the requested tick |
 | Bounded, back-pressured TX FIFO | flow-controlled `send()` | `tx_fifo_buffers` (default 96 = 8.5 ms); the Soapy adapter waits like the UHD adapter |
-| Timed TX | FPGA holds bursts until their tick | `timed_tx` gate (§8.1) |
+| Timed TX | FPGA emits each sample at its tick | `timed_tx` gate (whole-frame hold/late/stale) + RF-domain fine gate (every word in the slot of its own tick) |
 
 With `time_base=samples` in `device_args` every SoapySDR "timeNs" value exchanged with the plugin is a
-sample count, so there is no nanosecond conversion anywhere between the lower PHY and the radio
-(`lib/radio/soapy`: `soapy_time_in_samples`, `soapy_samples_to_api`, `soapy_api_to_samples`).
+sample count (`lib/radio/soapy`: `soapy_time_in_samples`, `soapy_samples_to_api`,
+`soapy_api_to_samples`), and since gateware v6 the FPGA works in the same unit: a sample counter in the
+RF clock domain stamps RX frames and times every TX word. There is no nanosecond value anywhere
+between the lower PHY and the converters, and no second oscillator in the timing path.
 
 At start the DL now runs 27–28 slots ahead of RX (5 ms budget + FIFO) instead of 177–194, and the first
 RX label equals `init_time`.

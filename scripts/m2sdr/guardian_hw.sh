@@ -2,11 +2,11 @@
 # Guardian for the hardware-timed TX mode (m2sdr branch hw-timed-tx, device_args timed_tx=hardware).
 # No emission-offset measurement or RX shift juggling: the DL emission offset is a constant, applied once
 # through OCUDU_SOAPY_RX_TS_SHIFT. Keeps the gNB alive, restarts it on real-time trouble, logs on change.
-# Usage: guardian_hw.sh [shift_samples]   (default -46 = minus the align.py RX-minus-TX offset)
+# Usage: guardian_hw.sh [shift_samples]   (default -42 = minus the align.py RX-minus-TX offset)
 # Stop:  touch /home/dmd/ocudu/build/captures/guardian_hw.stop
 set +e
 B=/home/dmd/ocudu/build; C=$B/captures; cd $B
-SHIFT=${1:--46}
+SHIFT=${1:--42}
 G=$C/guardian_hw.log; L=$C/gnb_hwtimed_console.log; STOP=$C/guardian_hw.stop
 U=/home/dmd/m2sdr/litex_m2sdr/software/user/m2sdr_util
 A(){ timeout 20 adb "$@" 2>/dev/null; }
