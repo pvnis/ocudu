@@ -149,7 +149,7 @@ public:
         .tx_time_offset         = static_cast<baseband_gateway_timestamp>(tx_time_offset),
         .rx_to_tx_max_delay     = get_rx_to_tx_delay_samples(config.srate) + proc_bb_adaptor_config.tx_time_offset,
         .rx_buffer_size         = rx_buffer_size,
-        .nof_rx_buffers         = std::max(16U, rx_to_tx_max_delay / rx_buffer_size),
+        .nof_rx_buffers         = std::max(4U, rx_to_tx_max_delay / rx_buffer_size),
         .system_time_throttling = config.system_time_throttling,
         .stop_nof_slots         = 2 * config.max_processing_delay_slots};
 

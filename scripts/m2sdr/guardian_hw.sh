@@ -2,11 +2,14 @@
 # Guardian for the hardware-timed TX mode (m2sdr branch hw-timed-tx, device_args timed_tx=hardware).
 # No emission-offset measurement or RX shift juggling: the DL emission offset is a constant, applied once
 # through OCUDU_SOAPY_RX_TS_SHIFT. Keeps the gNB alive, restarts it on real-time trouble, logs on change.
-# Usage: guardian_hw.sh [shift_samples]   (default -42 = minus the align.py RX-minus-TX offset)
+# Usage: guardian_hw.sh [shift_samples] [rx_to_tx_delay_us]
+#   shift_samples      default -42 = minus the align.py RX-minus-TX offset
+#   rx_to_tx_delay_us  default 4000 = how far ahead of the newest RX sample the DL is generated
+#                      (OCUDU stock is 1000; see docs/m2sdr_soapy_bringup.md 8.6 for why 4000 here)
 # Stop:  touch /home/dmd/ocudu/build/captures/guardian_hw.stop
 set +e
 B=/home/dmd/ocudu/build; C=$B/captures; cd $B
-SHIFT=${1:--42}
+SHIFT=${1:--42}; DELAY=${2:-4000}
 G=$C/guardian_hw.log; L=$C/gnb_hwtimed_console.log; STOP=$C/guardian_hw.stop
 U=/home/dmd/m2sdr/litex_m2sdr/software/user/m2sdr_util
 A(){ timeout 20 adb "$@" 2>/dev/null; }
@@ -16,8 +19,8 @@ start_gnb(){
   timeout 20 sudo pkill -INT -x gnb; for i in $(seq 15); do pgrep -x gnb >/dev/null||break; sleep 1; done; pgrep -x gnb >/dev/null && timeout 10 sudo pkill -9 -x gnb; sleep 1
   [ -s $L ] && cp $L $C/gnb_hwtimed_console.prev.log
   sudo rm -f /tmp/ocudu_soapy_rx_ts_shift
-  timeout 20 sudo -b sh -c "env OCUDU_LPHY_RX_TO_TX_DELAY_US=5000 OCUDU_SOAPY_RX_TS_SHIFT=$SHIFT nohup $B/apps/gnb/gnb -c $B/gnb_soapy_m2sdr_hwtimed.yml > $L 2>&1 < /dev/null"
-  sleep 20; log "gNB started (shift $SHIFT): $(pgrep -x gnb >/dev/null && echo up || echo FAILED)"
+  timeout 20 sudo -b sh -c "env OCUDU_LPHY_RX_TO_TX_DELAY_US=$DELAY OCUDU_SOAPY_RX_TS_SHIFT=$SHIFT nohup $B/apps/gnb/gnb -c $B/gnb_soapy_m2sdr_hwtimed.yml > $L 2>&1 < /dev/null"
+  sleep 20; log "gNB started (shift $SHIFT, rx-to-tx delay $DELAY us): $(pgrep -x gnb >/dev/null && echo up || echo FAILED)"
 }
 # The gNB warns that DRM KMS connector polling "may hinder performance"; disable it (reversible, resets
 # on reboot). This is host hygiene, not the cure for the UL storms -- those came from non-sample-exact

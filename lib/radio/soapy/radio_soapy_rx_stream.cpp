@@ -375,12 +375,30 @@ baseband_gateway_receiver::metadata radio_soapy_rx_stream::receive(baseband_gate
     }
   }
 
+  // Delivery lag: age of the newest received sample when the block reaches the lower PHY. Sampled about 20 times
+  // per second (each sample costs a hardware time read) and reported every 5 seconds.
   rx_lag_counter += rxd_total;
-  if (rx_lag_counter >= static_cast<uint64_t>(srate_hz * 5)) {
+  if (rx_lag_counter >= static_cast<uint64_t>(srate_hz / 20)) {
     rx_lag_counter = 0;
     long long hw_now = 0;
     if (device.get_hardware_time(hw_now)) {
-      fmt::print("Soapy RX lag: {} us behind hardware time. non-contiguous labels so far: {} (of which >2 samples: {}).\n", soapy_api_to_ns(hw_now - samples_to_ns(ret.ts + rxd_total - rx_ts_shift, srate_hz), srate_hz) / 1000, rx_ts_small_jumps, rx_ts_jumps);
+      const long long lag_us =
+          soapy_api_to_ns(hw_now - samples_to_ns(ret.ts + rxd_total - rx_ts_shift, srate_hz), srate_hz) / 1000;
+      rx_lag_min = (rx_lag_count == 0) ? lag_us : std::min(rx_lag_min, lag_us);
+      rx_lag_max = (rx_lag_count == 0) ? lag_us : std::max(rx_lag_max, lag_us);
+      rx_lag_sum += lag_us;
+      if (++rx_lag_count >= 100) {
+        fmt::print("Soapy RX lag: {} us behind hardware time (min {} / max {} us over {} samples). non-contiguous "
+                   "labels so far: {} (of which >2 samples: {}).\n",
+                   rx_lag_sum / rx_lag_count,
+                   rx_lag_min,
+                   rx_lag_max,
+                   rx_lag_count,
+                   rx_ts_small_jumps,
+                   rx_ts_jumps);
+        rx_lag_count = 0;
+        rx_lag_sum   = 0;
+      }
     }
   }
 

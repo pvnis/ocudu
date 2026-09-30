@@ -48,6 +48,10 @@ class radio_soapy_tx_stream : public baseband_gateway_transmitter, public soapy_
   uint64_t            tx_dump_start_ts = 0;
   unsigned            tx_dump_count    = 0;
   uint64_t            tx_lead_counter  = 0;
+  unsigned            tx_lead_count    = 0;
+  long long           tx_lead_min      = 0;
+  long long           tx_lead_max      = 0;
+  long long           tx_lead_sum      = 0;
   radio_soapy_tx_stream_fsm       state_fsm;
   rt_stop_event_source            stop_control;
   ocudulog::basic_logger&         logger;

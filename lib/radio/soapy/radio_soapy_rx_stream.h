@@ -47,6 +47,10 @@ class radio_soapy_rx_stream : public baseband_gateway_receiver, public soapy_exc
   uint64_t             rx_dump_skip = 0;
   uint64_t             rx_dump_start_ts = 0;
   uint64_t             rx_lag_counter   = 0;
+  unsigned             rx_lag_count     = 0;
+  long long            rx_lag_min       = 0;
+  long long            rx_lag_max       = 0;
+  long long            rx_lag_sum       = 0;
   /// Runtime timestamp shift in samples (label = hardware timestamp + shift), reloaded on SIGUSR2.
   int64_t     rx_ts_shift          = 0;
   uint64_t    rx_ts_jumps          = 0;

@@ -65,11 +65,14 @@ All in the working tree of branch `soapy`, committed with this document.
 ### 2.2 `lib/phy/lower/lower_phy_factory.cpp`
 
 * `OCUDU_LPHY_RX_TO_TX_DELAY_US` (default 1000, minimum 1000) sets how far ahead of the last received
-  sample the DL is generated (`rx_to_tx_max_delay`). 5 ms is needed here.
-* RX buffer pool floor raised from 4 to 16 buffers.
+  sample the DL is generated (`rx_to_tx_max_delay`). 5 ms was needed with the software-timed TX; with
+  the hardware-timed TX and the RX delivery lag removed the guardian uses 4 ms (§8.6). This is the only
+  remaining change outside `lib/radio/soapy`.
+* (The RX buffer pool floor, raised from 4 to 16 buffers during the bring-up, is back to stock.)
 
 ### 2.3 `lib/phy/lower/processors/resource_request_pool.h`
 
+**Reverted to stock (16 entries) on 2026-09-30** once the RX delivery lag was removed (§8.6). History:
 `request_array_size` 16 → 64. The lower PHY keeps pending PUxCH requests in a ring indexed by slot.
 With a 5 ms lead + `max_proc_delay 3` the MAC issues UL requests ~13 slots ahead; on the 16-entry
 ring a request landed on the same index as an older slot and was evicted ("PUxCH request late",
@@ -355,7 +358,7 @@ knob, §8.3). Measure with the phone silent (airplane mode): its uplink bursts s
     and still restarts on storms, as a safety net only.
   - The fix lives in the radio, where a USRP has it too (§8.5).
 
-* Genuine host stalls (> TX lead of 4.8 ms) still cost DL frames (dropped as late, silence) and a
+* Genuine host stalls (longer than the TX lead, 3.9 ms at the default 4 ms delay) still cost DL frames (dropped as late, silence) and a
   burst restart in OCUDU; that is the intended USRP-like behaviour, but the stall itself is the host's
   (§3.5).
 * Since gateware v6 the timing path has a single clock (the sample counter in the RF domain), so the
@@ -386,7 +389,57 @@ between the lower PHY and the converters, and no second oscillator in the timing
 At start the DL now runs 27–28 slots ahead of RX (5 ms budget + FIFO) instead of 177–194, and the first
 RX label equals `init_time`.
 
-Remaining OCUDU core deltas for this radio: `lower_phy_factory.cpp` (`OCUDU_LPHY_RX_TO_TX_DELAY_US`,
-RX buffer floor) and `resource_request_pool.h` (64 entries). They exist because frames must reach the
-FPGA ~1 ms before their time and RX is delivered with up to 0.7 ms lag (one IRQ per 8 DMA buffers); the
-stock 1 ms budget needs that RX latency reduced first.
+Remaining OCUDU core delta for this radio: `OCUDU_LPHY_RX_TO_TX_DELAY_US` in `lower_phy_factory.cpp`
+(§8.6). The request pool and the RX buffer floor are stock again.
+
+### 8.6 RX delivery lag, interrupts, and what still keeps the DL lead above 1 ms
+
+Full write-up with all numbers: `~/m2sdr/doc/rx_delivery_lag.md`.
+
+**RX delivery lag** (age of the newest sample when a DMA buffer reaches the receiving thread):
+
+| | p50 | p99 | max |
+|---|---|---|---|
+| before (one interrupt per 8 buffers, completed-buffer count one short) | 472 µs | 724 µs | 1.4 ms |
+| now (one interrupt per buffer, count fixed) | 8 µs | 38–46 µs | 0.7–1.0 ms |
+| busy-poll (`rx_poll=busy`, the poll-mode-driver model) | 4 µs | 8–22 µs | 0.6–1.1 ms |
+
+As seen by the lower PHY: 355 µs average before, 20 µs now. Two causes were fixed in the m2sdr kernel
+driver: the interrupt cadence (module parameter `rx_irq_period`, now 1) and an off-by-one in the
+completed-buffer count that withheld the newest complete buffer until the next interrupt. The adapter
+now prints min/avg/max for `Soapy RX lag` and `Soapy TX lead` every 5 s (about 20 samples per second).
+
+**What that allowed in OCUDU:** `resource_request_pool.h` back to 16 entries, RX buffer floor back to 4,
+and the DL lead from 5 ms to 4 ms (`guardian_hw.sh [shift] [delay_us]`). The TX lead at hand-off is now
+the configured delay minus ~50 µs (it was the delay minus 0.5–0.8 ms).
+
+**Why not the stock 1 ms:** the RX side would allow it, the TX ring does not. The TX DMA reader
+free-runs through a 256-slot ring and is paced only by the timed gate holding the frame at its head.
+When a host stall lets it catch up with the write pointer, every slot ahead holds a stale frame, which
+the gate drops at PCIe speed; the reader then laps the ring every ~2 ms and the host cannot get back in
+front of it for 70–80 ms. So one stall longer than (delay − ~0.55 ms) costs ~500 late frames instead of
+the few that were really late:
+
+| `OCUDU_LPHY_RX_TO_TX_DELAY_US` | result |
+|---|---|
+| 5000 | clean in the soaks; an episode needs a stall above ~4.4 ms |
+| 4000 (guardian default) | one episode in a first 5-minute soak with phone traffic, none in the following 11 minutes; 6 of 6 starts attach and ping 150/150 |
+| 2000 | clean for minutes, then an episode when the phone attached (+1000 late frames, guardian restart) |
+| 1500 | 8–12 episodes per 45 s |
+| 1000 (stock) | continuous |
+
+The fix is FIFO semantics for the TX DMA (LitePCIe table "prog" mode in the kernel driver, or a
+pre-stamped silence timeline in the ring); then 1 ms works with 0.7–0.9 ms of margin and the last core
+change can be dropped. Not done yet.
+
+**Would a DPDK poll-mode driver help?** Measured with `rx_poll=busy`, which is the PMD wake-up model on
+the existing driver: 4 µs better at the median, ~25 µs at p99, nothing in the tail, for one core at
+100 %. The tail on this host is firmware and host stalls, not the wake-up path: the `hwlat` tracer
+shows gaps of up to 224 µs with interrupts disabled at least once per second, and the Wi-Fi interface
+re-associates every ~30 minutes with an 11.6 ms stall of everything. A PMD only pays with isolated
+cores, smaller frames (the 89 µs frame time is the real floor) or much higher frame rates, and it
+would replace the kernel driver's other functions and the SoapySDR path. The thing a PMD would bring
+that matters here, a descriptor-ring TX queue, is the FIFO fix above and does not need DPDK.
+
+Host observations worth knowing: the Wi-Fi roam every ~30 min (kernel log, `wlp5s0: associated`) is a
+guaranteed RX discontinuity and a TX underrun; the link then recovers by itself.

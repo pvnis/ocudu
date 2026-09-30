@@ -22,7 +22,7 @@ class resource_request_pool
 {
 public:
   /// Maximum number of requests contained in the array.
-  static constexpr unsigned request_array_size = 64; // was 16: must exceed the MAC-to-RX lead (rx_to_tx_delay + max_proc_delay slots) with margin
+  static constexpr unsigned request_array_size = 16;
 
   /// Internal storage type.
   struct request_type {

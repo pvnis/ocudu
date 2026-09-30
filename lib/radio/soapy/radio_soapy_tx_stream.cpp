@@ -313,12 +313,27 @@ void radio_soapy_tx_stream::transmit(const baseband_gateway_buffer_reader&      
     }
   }
 
+  // Transmit lead: how far ahead of the hardware time a block is handed to the driver. Sampled about 20 times per
+  // second and reported every 5 seconds; the first number is the minimum (the margin that matters).
   tx_lead_counter += data_nof_samples;
-  if (tx_lead_counter >= static_cast<uint64_t>(srate_hz * 5)) {
+  if (tx_lead_counter >= static_cast<uint64_t>(srate_hz / 20)) {
     tx_lead_counter = 0;
     long long hw_now = 0;
     if (device.get_hardware_time(hw_now)) {
-      fmt::print("Soapy TX lead: stamps are {} us ahead of hardware time.\n", soapy_api_to_ns(time_ns - hw_now, srate_hz) / 1000);
+      const long long lead_us = soapy_api_to_ns(time_ns - hw_now, srate_hz) / 1000;
+      tx_lead_min = (tx_lead_count == 0) ? lead_us : std::min(tx_lead_min, lead_us);
+      tx_lead_max = (tx_lead_count == 0) ? lead_us : std::max(tx_lead_max, lead_us);
+      tx_lead_sum += lead_us;
+      if (++tx_lead_count >= 100) {
+        fmt::print("Soapy TX lead: stamps are {} us ahead of hardware time at least (avg {} / max {} us over {} "
+                   "samples).\n",
+                   tx_lead_min,
+                   tx_lead_sum / tx_lead_count,
+                   tx_lead_max,
+                   tx_lead_count);
+        tx_lead_count = 0;
+        tx_lead_sum   = 0;
+      }
     }
   }
 
