@@ -1,7 +1,8 @@
 # LOW-LATENCY variant of gnb_soapy_m2sdr_hwtimed.yml (srsRAN low_latency.yml recommendations applied):
 # TDD DDSU 2 ms period (UL slot every 2 ms vs 5), sr_period 2 ms (was 20), min_k1=min_k2=2 (was 4),
-# periodic_bsr_timer 1, max_proc_delay 3 (was 5). Measured one-way UL 21.8 -> ~10 ms, RTT 28 -> 16 ms.
-# Tradeoff: lower max_proc_delay cuts latency but raises UL BLER; raise it back to 5 for best reliability.
+# periodic_bsr_timer 1, max_proc_delay 1 (was 5). On a PREEMPT_RT kernel: one-way DL 4.6 / UL 7.75 /
+# RTT 12 ms, 0% ping loss. NOTE: max_proc_delay 1 is reliable only on PREEMPT_RT (on the generic kernel it
+# raised UL BLER); on a generic kernel use max_proc_delay 3.
 # gNB on LiteX-M2SDR via SoapySDR, TDD n78 20 MHz at 3600 MHz, core = qcore on 127.0.0.1:38412
 # Sample-timed variant (m2sdr branch hw-timed-tx, gateware v7): the FPGA counts samples in the RF clock
 # domain, stamps each RX frame with the index of its first sample and emits every TX sample at its index.
@@ -65,4 +66,4 @@ log:
   mac_level: warning
 
 expert_phy:
-  max_proc_delay: 3
+  max_proc_delay: 1
