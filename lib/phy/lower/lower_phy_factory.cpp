@@ -4,6 +4,7 @@
 
 #include "ocudu/phy/lower/lower_phy_factory.h"
 #include "lower_phy_impl.h"
+#include <cstdlib>
 
 using namespace ocudu;
 
@@ -127,6 +128,17 @@ public:
     std::unique_ptr<lower_phy_uplink_processor> ul_proc = uplink_proc_factory->create(ul_proc_config);
     ocudu_assert(dl_proc, "Failed to create the UL processor.");
 
+    // ---- M1 (radio_heads_prep_time = H-slot offset, aygong/srsRAN_Project_Low_Latency): the DL preparation
+    // lead relative to the radio. rx_to_tx_max_delay = srate_kHz * (H-1)/slots_per_subframe + tx_offset.
+    // H=3 reproduces the stock 1 ms lead; H=1 gives the minimal lead (DL generated just-in-time). ----
+    unsigned radio_heads_prep_time = 3;
+    if (const char* env = std::getenv("OCUDU_LPHY_RADIO_HEADS_PREP_TIME")) {
+      radio_heads_prep_time = static_cast<unsigned>(std::max(1L, std::strtol(env, nullptr, 10)));
+    }
+    const unsigned slots_per_subframe = pow2(to_numerology_value(config.scs));
+    const unsigned rx_to_tx_delay_m1 =
+        config.srate.to_kHz() * (radio_heads_prep_time - 1) / slots_per_subframe + static_cast<unsigned>(tx_time_offset);
+
     // Prepare processor baseband adaptor configuration.
     lower_phy_baseband_processor_configuration proc_bb_adaptor_config = {
         .srate                  = config.srate,
@@ -134,7 +146,7 @@ public:
         .nof_tx_ports           = config.nof_tx_ports,
         .nof_rx_ports           = config.nof_rx_ports,
         .tx_time_offset         = static_cast<baseband_gateway_timestamp>(tx_time_offset),
-        .rx_to_tx_max_delay     = config.srate.to_kHz() + proc_bb_adaptor_config.tx_time_offset,
+        .rx_to_tx_max_delay     = rx_to_tx_delay_m1,
         .rx_buffer_size         = rx_buffer_size,
         .nof_rx_buffers         = std::max(4U, rx_to_tx_max_delay / rx_buffer_size),
         .system_time_throttling = config.system_time_throttling,
