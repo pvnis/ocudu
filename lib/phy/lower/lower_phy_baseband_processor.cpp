@@ -74,6 +74,27 @@ void lower_phy_baseband_processor::dl_process(baseband_gateway_timestamp timesta
     return;
   }
 
+  // ---- M1 (prepare DL samples in advance, aygong/srsRAN_Project_Low_Latency): generate and enqueue the DL
+  // baseband at the START of the slot, before the throttle wait, instead of after it. ----
+  // Process downlink buffer.
+  downlink_processor_baseband::processing_result result =
+      downlink_processor.process(apply_timestamp_sfn0_ref(timestamp));
+  ocudu_assert(result.buffer, "The buffer must be valid.");
+
+  // Set transmission timestamp.
+  result.metadata.ts = timestamp + tx_time_offset;
+
+  // Enqueue transmission.
+  {
+    trace_point tx_tp = ru_tracer.now();
+    transmitter.transmit(result.buffer->get_reader(), result.metadata);
+    ru_tracer << trace_event("transmit_baseband", tx_tp);
+  }
+
+  // Update last buffer size.
+  last_tx_buffer_size = result.buffer->get_nof_samples();
+
+
   // Throttling mechanism to keep a maximum latency of one millisecond in the transmit buffer based on the latest
   // received timestamp.
   {
@@ -110,25 +131,6 @@ void lower_phy_baseband_processor::dl_process(baseband_gateway_timestamp timesta
     }
   }
   last_tx_time.emplace(std::chrono::high_resolution_clock::now());
-
-  // Process downlink buffer.
-  downlink_processor_baseband::processing_result result =
-      downlink_processor.process(apply_timestamp_sfn0_ref(timestamp));
-  ocudu_assert(result.buffer, "The buffer must be valid.");
-
-  // Set transmission timestamp.
-  result.metadata.ts = timestamp + tx_time_offset;
-
-  // Enqueue transmission.
-  trace_point tx_tp = ru_tracer.now();
-
-  // Transmit buffer.
-  transmitter.transmit(result.buffer->get_reader(), result.metadata);
-
-  ru_tracer << trace_event("transmit_baseband", tx_tp);
-
-  // Update last buffer size.
-  last_tx_buffer_size = result.buffer->get_nof_samples();
 
   // Enqueue DL process task.
   report_fatal_error_if_not(
