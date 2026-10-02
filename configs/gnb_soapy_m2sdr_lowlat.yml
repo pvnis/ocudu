@@ -1,0 +1,68 @@
+# LOW-LATENCY variant of gnb_soapy_m2sdr_hwtimed.yml (srsRAN low_latency.yml recommendations applied):
+# TDD DDSU 2 ms period (UL slot every 2 ms vs 5), sr_period 2 ms (was 20), min_k1=min_k2=2 (was 4),
+# periodic_bsr_timer 1, max_proc_delay 3 (was 5). Measured one-way UL 21.8 -> ~10 ms, RTT 28 -> 16 ms.
+# Tradeoff: lower max_proc_delay cuts latency but raises UL BLER; raise it back to 5 for best reliability.
+# gNB on LiteX-M2SDR via SoapySDR, TDD n78 20 MHz at 3600 MHz, core = qcore on 127.0.0.1:38412
+# Sample-timed variant (m2sdr branch hw-timed-tx, gateware v7): the FPGA counts samples in the RF clock
+# domain, stamps each RX frame with the index of its first sample and emits every TX sample at its index.
+# device_args timed_tx=hardware,time_base=samples: all times exchanged with the radio are sample counts.
+# The constant RX-minus-TX offset (42 samples, scripts/m2sdr/align.py) is applied once with
+# OCUDU_SOAPY_RX_TS_SHIFT=-42. Run through scripts/m2sdr/guardian_hw.sh. The lower PHY and all PHY timing
+# settings are OCUDU defaults; this needs the m2sdr kernel module of branch hw-timed-tx (one interrupt per
+# RX buffer, FIFO TX queue);
+# see docs/m2sdr_soapy_bringup.md section 8.
+# Keep the carrier <= 40 MHz: the AD9361 analog filter tops out at 56 MHz.
+
+cu_cp:
+  amf:
+    addrs: 127.0.0.1
+    port: 38412
+    bind_addrs: 127.0.0.1
+    supported_tracking_areas:
+      - tac: 1
+        plmn_list:
+          - plmn: "00101"
+            tai_slice_support_list:
+              - sst: 1
+
+ru_sdr:
+  device_driver: soapy
+  device_args: driver=LiteXM2SDR,ad9361_fir_profile=bypass,rx_worker_packets=2048,freq_corr_ppm=1.327,timed_tx=hardware,time_base=samples
+  srate: 23.04
+  tx_gain: -10             # = 10 dB attenuation on the M2SDR
+  rx_gain: 40
+  time_alignment_calibration: 0
+  expert_cfg:
+    tx_mode: continuous      # gap-free TX stream (discontinuous mode is untested on the hardware-timed path)
+
+cell_cfg:
+  dl_arfcn: 640000   # 3600.00 MHz, n78
+  band: 78
+  channel_bandwidth_MHz: 20
+  common_scs: 30
+  plmn: "00101"
+  tac: 1
+  pci: 101
+  pusch:
+    min_k2: 2
+  pucch:
+    sr_period_ms: 2
+    min_k1: 2
+  tdd_ul_dl_cfg:
+    dl_ul_tx_period: 4
+    nof_dl_slots: 2
+    nof_dl_symbols: 6
+    nof_ul_slots: 1
+    nof_ul_symbols: 4
+  mac_cell_group:
+    bsr_cfg:
+      periodic_bsr_timer: 1
+
+log:
+  filename: /tmp/gnb.log
+  all_level: warning
+  phy_level: warning
+  mac_level: warning
+
+expert_phy:
+  max_proc_delay: 3

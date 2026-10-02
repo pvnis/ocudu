@@ -8,7 +8,7 @@
 # Stop:  touch /home/dmd/ocudu/build/captures/guardian_hw.stop
 set +e
 B=/home/dmd/ocudu/build; C=$B/captures; cd $B
-SHIFT=${1:--42}
+SHIFT=${1:--42}; CFG=${CONFIG:-$B/gnb_soapy_m2sdr_hwtimed.yml}
 G=$C/guardian_hw.log; L=$C/gnb_hwtimed_console.log; STOP=$C/guardian_hw.stop
 U=/home/dmd/m2sdr/litex_m2sdr/software/user/m2sdr_util
 A(){ timeout 20 adb "$@" 2>/dev/null; }
@@ -18,8 +18,8 @@ start_gnb(){
   timeout 20 sudo pkill -INT -x gnb; for i in $(seq 15); do pgrep -x gnb >/dev/null||break; sleep 1; done; pgrep -x gnb >/dev/null && timeout 10 sudo pkill -9 -x gnb; sleep 1
   [ -s $L ] && cp $L $C/gnb_hwtimed_console.prev.log
   sudo rm -f /tmp/ocudu_soapy_rx_ts_shift
-  timeout 20 sudo -b sh -c "env OCUDU_SOAPY_RX_TS_SHIFT=$SHIFT nohup $B/apps/gnb/gnb -c $B/gnb_soapy_m2sdr_hwtimed.yml > $L 2>&1 < /dev/null"
-  sleep 20; log "gNB started (shift $SHIFT): $(pgrep -x gnb >/dev/null && echo up || echo FAILED)"
+  timeout 20 sudo -b sh -c "env OCUDU_SOAPY_RX_TS_SHIFT=$SHIFT nohup $B/apps/gnb/gnb -c $CFG > $L 2>&1 < /dev/null"
+  sleep 20; log "gNB started (shift $SHIFT, cfg $(basename $CFG)): $(pgrep -x gnb >/dev/null && echo up || echo FAILED)"
 }
 # The gNB warns that DRM KMS connector polling "may hinder performance"; disable it (reversible, resets
 # on reboot). This is host hygiene, not the cure for the UL storms -- those came from non-sample-exact
