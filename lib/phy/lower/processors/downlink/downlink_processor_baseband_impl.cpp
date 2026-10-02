@@ -11,6 +11,9 @@
 #include "ocudu/phy/lower/lower_phy_baseband_metrics.h"
 #include "ocudu/phy/lower/lower_phy_timing_context.h"
 
+#include <cstdlib>
+#include <cstdio>
+
 using namespace ocudu;
 
 downlink_processor_baseband_impl::downlink_processor_baseband_impl(
@@ -135,6 +138,9 @@ downlink_processor_baseband_impl::process(baseband_gateway_timestamp timestamp)
                                  .time_point = std::chrono::system_clock::now() + nof_slot_tti_in_advance_ns});
     previous_slot = slot;
     ru_tracer << trace_event("on_tti_boundary", tp);
+    // Record the notify time for the slot being requested (i_slot + M), and measure the realized M-offset for
+    // the slot now being processed (i_slot), whose notify fired M slots ago.
+    dlp_update(i_slot);
 
     // Obtain the downlink baseband processing for the slot independently of the sample alignment. This avoids leaving
     // resource grids in the PDxCH processor.
@@ -195,4 +201,57 @@ downlink_processor_baseband_impl::process(baseband_gateway_timestamp timestamp)
 void downlink_processor_baseband_impl::set_tx_time_offset(phy_time_unit tx_time_offset_)
 {
   tx_time_offset.store(tx_time_offset_.to_nearest_samples(rate.to_Hz()), std::memory_order_relaxed);
+}
+
+void downlink_processor_baseband_impl::dlp_update(unsigned i_slot)
+{
+  if (dlp_period_s < 0.0) {
+    const char* env = std::getenv("OCUDU_DL_PIPELINE_STATS");
+    dlp_period_s    = env ? std::atof(env) : 0.0;
+    if (dlp_period_s > 0.0) {
+      dlp_hist.assign(512, 0);
+    }
+    dlp_t0 = std::chrono::steady_clock::now();
+  }
+  if (dlp_period_s <= 0.0) {
+    return;
+  }
+  const uint64_t now_ns =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+  const unsigned M   = nof_slot_tti_in_advance;
+  const unsigned RING = dlp_notify_ns.size();
+  // Notify time for the slot requested now (i_slot + M).
+  dlp_notify_ns[(i_slot + M) % RING] = now_ns;
+  // Measure the realized M-offset for the slot being processed now (i_slot): notify fired M slots ago.
+  const uint64_t t_notify = dlp_notify_ns[i_slot % RING];
+  if (t_notify == 0 || now_ns < t_notify) {
+    return;
+  }
+  const uint64_t lat_us = (now_ns - t_notify) / 1000;
+  dlp_min = dlp_n ? std::min<uint64_t>(dlp_min, lat_us) : lat_us;
+  dlp_max = dlp_n ? std::max<uint64_t>(dlp_max, lat_us) : lat_us;
+  dlp_hist[std::min<uint64_t>(lat_us / 10, dlp_hist.size() - 1)]++;   // 10 us bins, 5.12 ms range
+  ++dlp_n;
+  const auto now = std::chrono::steady_clock::now();
+  if (std::chrono::duration<double>(now - dlp_t0).count() < dlp_period_s) {
+    return;
+  }
+  const double q[4] = {0.50, 0.90, 0.99, 0.999};
+  long long    pct[4] = {0, 0, 0, 0};
+  uint64_t     acc = 0;
+  unsigned     qi = 0;
+  for (unsigned b = 0; b < dlp_hist.size() && qi < 4; ++b) {
+    acc += dlp_hist[b];
+    while (qi < 4 && static_cast<double>(acc) >= q[qi] * static_cast<double>(dlp_n)) {
+      pct[qi++] = static_cast<long long>(b) * 10;
+    }
+  }
+  std::fprintf(stderr,
+               "gNB DL M-offset (notify->process, us): M=%u n=%llu min=%llu p50=%lld p90=%lld p99=%lld p99.9=%lld max=%llu\n",
+               M, (unsigned long long)dlp_n, (unsigned long long)dlp_min, pct[0], pct[1], pct[2], pct[3],
+               (unsigned long long)dlp_max);
+  std::fflush(stderr);
+  std::fill(dlp_hist.begin(), dlp_hist.end(), 0);
+  dlp_n = 0;
+  dlp_t0 = now;
 }

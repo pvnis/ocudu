@@ -20,6 +20,11 @@
 #include "ocudu/ran/slot_point_extended.h"
 #include "ocudu/support/math/stats.h"
 
+#include <array>
+#include <chrono>
+#include <cstdint>
+#include <vector>
+
 namespace ocudu {
 
 /// Collects downlink processor baseband configuration parameters.
@@ -224,6 +229,15 @@ private:
   dynamic_tensor<2, cf_t> cf_buffer;
   /// Carrier Frequency Offset processor.
   baseband_cfo_processor cfo_processor;
+  // ---- gNB-side DL M-offset instrumentation (OCUDU_DL_PIPELINE_STATS=<report seconds>): wall-clock latency
+  // from a slot's on_tti_boundary notification to when its grid is processed, i.e. the realized M-slot offset.
+  // M2 (event-driven / fractional M) reduces this. Phone-independent. ----
+  void dlp_update(unsigned i_slot);
+  std::array<uint64_t, 256> dlp_notify_ns{};
+  double                    dlp_period_s = -1.0;
+  std::vector<uint32_t>     dlp_hist;
+  uint64_t                  dlp_n = 0, dlp_min = 0, dlp_max = 0;
+  std::chrono::steady_clock::time_point dlp_t0;
   /// Baseband buffer pool for transmitting zeros.
   baseband_gateway_buffer_pool buffer_pool;
   /// Previous reported slot.
