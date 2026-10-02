@@ -17,7 +17,9 @@
 #include "ocudu/ran/cyclic_prefix.h"
 #include "ocudu/ran/n_ta_offset.h"
 #include "ocudu/ran/subcarrier_spacing.h"
+#include "ocudu/ran/tdd/tdd_ul_dl_config.h"
 #include "ocudu/support/executors/task_executor.h"
+#include <optional>
 
 namespace ocudu {
 
@@ -88,6 +90,11 @@ struct lower_phy_configuration {
   lower_phy_baseband_buffer_size_policy baseband_rx_buffer_size_policy;
   /// Amplitude control parameters, including baseband gain and clipping.
   amplitude_controller_clipping_config amplitude_config;
+  /// \brief Optional TDD UL/DL pattern (common).
+  ///
+  /// When present, the downlink baseband processor uses it to tell DL slots apart from UL/guard slots. This enables the
+  /// M2 event-driven downlink path to busy-wait for the modulated grid only on DL slots. Empty in FDD.
+  std::optional<tdd_ul_dl_config_common> tdd_ul_dl_cfg_common;
 };
 
 /// Lower physical layer dependencies.

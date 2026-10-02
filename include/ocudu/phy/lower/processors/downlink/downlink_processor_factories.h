@@ -7,7 +7,9 @@
 #include "ocudu/phy/lower/processors/downlink/downlink_processor.h"
 #include "ocudu/phy/lower/processors/downlink/pdxch/pdxch_processor_factories.h"
 #include "ocudu/phy/lower/sampling_rate.h"
+#include "ocudu/ran/tdd/tdd_ul_dl_config.h"
 #include <memory>
+#include <optional>
 
 namespace ocudu {
 
@@ -29,6 +31,8 @@ struct downlink_processor_configuration {
   unsigned nof_tx_ports;
   /// Number of slots notified in advance in the TTI boundary event.
   unsigned nof_slot_tti_in_advance;
+  /// Optional TDD UL/DL pattern (common). Used by the M2 event-driven DL path to gate the busy-wait to DL slots.
+  std::optional<tdd_ul_dl_config_common> tdd_ul_dl_cfg_common;
 };
 
 /// Lower physical layer downlink processor - Factory interface.

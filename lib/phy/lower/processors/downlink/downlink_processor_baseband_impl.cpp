@@ -11,8 +11,10 @@
 #include "ocudu/phy/lower/lower_phy_baseband_metrics.h"
 #include "ocudu/phy/lower/lower_phy_timing_context.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstdio>
+#include <thread>
 
 using namespace ocudu;
 
@@ -42,6 +44,47 @@ downlink_processor_baseband_impl::downlink_processor_baseband_impl(
   for (unsigned i_symbol = 0; i_symbol != nof_symbols_per_subframe; ++i_symbol) {
     unsigned cp_size = config.cp.get_length(i_symbol, config.scs).to_samples(config.rate.to_Hz());
     symbol_sizes_sf.emplace_back(cp_size + symbol_size_no_cp);
+  }
+
+  // ---- M2 (event-driven downlink) setup. Off unless OCUDU_LPHY_EVENT_DRIVEN_DL is set. ----
+  slot_duration_us = 1000 / nof_slots_per_subframe;
+  if (const char* env = std::getenv("OCUDU_LPHY_EVENT_DRIVEN_DL")) {
+    event_driven_dl = (std::strtol(env, nullptr, 10) != 0);
+  }
+  if (const char* env = std::getenv("OCUDU_LPHY_EVENT_DRIVEN_POLL_US")) {
+    event_driven_poll_us = static_cast<unsigned>(std::max(1L, std::strtol(env, nullptr, 10)));
+  }
+  event_driven_max_us = slot_duration_us;
+  if (const char* env = std::getenv("OCUDU_LPHY_EVENT_DRIVEN_MAX_US")) {
+    event_driven_max_us = static_cast<unsigned>(std::min<long>(slot_duration_us, std::max(1L, std::strtol(env, nullptr, 10))));
+  }
+  // Optional override of the DL TTI-in-advance (M). max_processing_delay_slots has a CLI minimum of 1; this env allows
+  // M=0, which is the event-driven operating point (notify the current slot, then busy-wait for its grid).
+  if (const char* env = std::getenv("OCUDU_LPHY_DL_TTI_IN_ADVANCE")) {
+    long v                  = std::max(0L, std::strtol(env, nullptr, 10));
+    nof_slot_tti_in_advance = static_cast<unsigned>(v);
+    nof_slot_tti_in_advance_ns =
+        std::chrono::nanoseconds(nof_slot_tti_in_advance * 1000000 / slot_point(config.scs, 0).nof_slots_per_subframe());
+  }
+
+  // Build the DL-symbols-per-slot list from the TDD pattern, so the busy-wait only fires on DL slots.
+  if (event_driven_dl && config.tdd_ul_dl_cfg_common.has_value()) {
+    const unsigned tdd_period_slots = nof_slots_per_tdd_period(*config.tdd_ul_dl_cfg_common);
+    dl_symbols_per_slot_lst.resize(tdd_period_slots);
+    for (unsigned i = 0; i != tdd_period_slots; ++i) {
+      dl_symbols_per_slot_lst[i] = get_active_tdd_dl_symbols(*config.tdd_ul_dl_cfg_common, i, config.cp).length();
+    }
+  }
+
+  if (event_driven_dl) {
+    std::fprintf(stderr,
+                 "gNB M2 event-driven DL: enabled (M=%u, poll=%u us, max_wait=%u us, slot=%u us, tdd_dl_slots_known=%d)\n",
+                 nof_slot_tti_in_advance,
+                 event_driven_poll_us,
+                 event_driven_max_us,
+                 slot_duration_us,
+                 static_cast<int>(!dl_symbols_per_slot_lst.empty()));
+    std::fflush(stderr);
   }
 }
 
@@ -133,18 +176,51 @@ downlink_processor_baseband_impl::process(baseband_gateway_timestamp timestamp)
   if (slot_point_extended slot(scs, i_slot); !previous_slot.has_value() || (*previous_slot != slot)) {
     ocudu_assert(notifier != nullptr, "Timing notifier is not connected.");
     trace_point tp = ru_tracer.now();
+    // For the event-driven path (M=0), the notify and the grid pull happen in this same call, so the ring-based
+    // M-offset instrument would read ~0. Capture the notify instant here and measure notify->grid-ready directly
+    // after the busy-wait below.
+    const uint64_t dlp_t_notify_ns =
+        event_driven_dl ? std::chrono::duration_cast<std::chrono::nanoseconds>(
+                              std::chrono::steady_clock::now().time_since_epoch())
+                              .count()
+                        : 0;
     notifier->on_tti_boundary(
         lower_phy_timing_context{.slot       = slot + nof_slot_tti_in_advance,
                                  .time_point = std::chrono::system_clock::now() + nof_slot_tti_in_advance_ns});
     previous_slot = slot;
     ru_tracer << trace_event("on_tti_boundary", tp);
     // Record the notify time for the slot being requested (i_slot + M), and measure the realized M-offset for
-    // the slot now being processed (i_slot), whose notify fired M slots ago.
-    dlp_update(i_slot);
+    // the slot now being processed (i_slot), whose notify fired M slots ago. (Ring-based path, M>=1.)
+    if (!event_driven_dl) {
+      dlp_update(i_slot);
+    }
 
     // Obtain the downlink baseband processing for the slot independently of the sample alignment. This avoids leaving
     // resource grids in the PDxCH processor.
     pdxch_baseband_result = pdxch_proc_baseband.process_slot({.slot = slot.without_hyper_sfn(), .sector = sector_id});
+
+    // M2 (event-driven downlink): with a reduced M, the grid for this slot may not have been modulated yet when the
+    // slot boundary is reached. Rather than transmitting zeros, busy-wait for on_modulation_completion to hand the
+    // modulated grid over through the PDxCH requests pool (picked up by re-reading process_slot). Bounded in time and
+    // restricted to DL slots: UL/guard slots never produce a grid, so waiting there would only burn the DL lead.
+    if (event_driven_dl && !pdxch_baseband_result.buffer && is_dl_enabled(slot)) {
+      const auto deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(event_driven_max_us);
+      while (!pdxch_baseband_result.buffer && (std::chrono::steady_clock::now() < deadline)) {
+        std::this_thread::sleep_for(std::chrono::microseconds(event_driven_poll_us));
+        pdxch_baseband_result =
+            pdxch_proc_baseband.process_slot({.slot = slot.without_hyper_sfn(), .sector = sector_id});
+      }
+    }
+
+    // Event-driven instrument: measure notify->grid-ready (the realized M-offset) for slots that produced a grid.
+    if (event_driven_dl && pdxch_baseband_result.buffer) {
+      const uint64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                  std::chrono::steady_clock::now().time_since_epoch())
+                                  .count();
+      if (now_ns >= dlp_t_notify_ns) {
+        dlp_record((now_ns - dlp_t_notify_ns) / 1000);
+      }
+    }
   }
 
   // Handle CFO and metrics if the PDxCH baseband result contains a buffer.
@@ -203,7 +279,7 @@ void downlink_processor_baseband_impl::set_tx_time_offset(phy_time_unit tx_time_
   tx_time_offset.store(tx_time_offset_.to_nearest_samples(rate.to_Hz()), std::memory_order_relaxed);
 }
 
-void downlink_processor_baseband_impl::dlp_update(unsigned i_slot)
+void downlink_processor_baseband_impl::dlp_init()
 {
   if (dlp_period_s < 0.0) {
     const char* env = std::getenv("OCUDU_DL_PIPELINE_STATS");
@@ -213,6 +289,11 @@ void downlink_processor_baseband_impl::dlp_update(unsigned i_slot)
     }
     dlp_t0 = std::chrono::steady_clock::now();
   }
+}
+
+void downlink_processor_baseband_impl::dlp_update(unsigned i_slot)
+{
+  dlp_init();
   if (dlp_period_s <= 0.0) {
     return;
   }
@@ -227,7 +308,15 @@ void downlink_processor_baseband_impl::dlp_update(unsigned i_slot)
   if (t_notify == 0 || now_ns < t_notify) {
     return;
   }
-  const uint64_t lat_us = (now_ns - t_notify) / 1000;
+  dlp_record((now_ns - t_notify) / 1000);
+}
+
+void downlink_processor_baseband_impl::dlp_record(uint64_t lat_us)
+{
+  dlp_init();
+  if (dlp_period_s <= 0.0) {
+    return;
+  }
   dlp_min = dlp_n ? std::min<uint64_t>(dlp_min, lat_us) : lat_us;
   dlp_max = dlp_n ? std::max<uint64_t>(dlp_max, lat_us) : lat_us;
   dlp_hist[std::min<uint64_t>(lat_us / 10, dlp_hist.size() - 1)]++;   // 10 us bins, 5.12 ms range
@@ -236,6 +325,7 @@ void downlink_processor_baseband_impl::dlp_update(unsigned i_slot)
   if (std::chrono::duration<double>(now - dlp_t0).count() < dlp_period_s) {
     return;
   }
+  const unsigned M    = nof_slot_tti_in_advance;
   const double q[4] = {0.50, 0.90, 0.99, 0.999};
   long long    pct[4] = {0, 0, 0, 0};
   uint64_t     acc = 0;

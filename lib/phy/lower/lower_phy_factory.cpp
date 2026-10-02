@@ -108,7 +108,8 @@ public:
                                                        .bandwidth_prb           = config.bandwidth_rb,
                                                        .center_frequency_Hz     = config.dl_freq_hz,
                                                        .nof_tx_ports            = config.nof_tx_ports,
-                                                       .nof_slot_tti_in_advance = config.max_processing_delay_slots};
+                                                       .nof_slot_tti_in_advance = config.max_processing_delay_slots,
+                                                       .tdd_ul_dl_cfg_common    = config.tdd_ul_dl_cfg_common};
 
     // Create downlink processor.
     std::unique_ptr<lower_phy_downlink_processor> dl_proc =

@@ -18,11 +18,13 @@
 #include "ocudu/phy/lower/sampling_rate.h"
 #include "ocudu/ran/cyclic_prefix.h"
 #include "ocudu/ran/slot_point_extended.h"
+#include "ocudu/ran/tdd/tdd_ul_dl_config.h"
 #include "ocudu/support/math/stats.h"
 
 #include <array>
 #include <chrono>
 #include <cstdint>
+#include <optional>
 #include <vector>
 
 namespace ocudu {
@@ -41,6 +43,8 @@ struct downlink_processor_baseband_configuration {
   unsigned nof_tx_ports;
   /// Number of slots notified in advance in the TTI boundary event.
   unsigned nof_slot_tti_in_advance;
+  /// Optional TDD UL/DL pattern (common). Used by the M2 event-driven DL path to gate the busy-wait to DL slots.
+  std::optional<tdd_ul_dl_config_common> tdd_ul_dl_cfg_common;
 };
 
 namespace detail {
@@ -193,6 +197,18 @@ public:
   void set_tx_time_offset(phy_time_unit tx_time_offset) override;
 
 private:
+  /// \brief Returns true if the given slot carries downlink symbols according to the TDD pattern.
+  ///
+  /// Returns true unconditionally when no TDD pattern is configured (FDD). Used by the M2 event-driven path to avoid
+  /// busy-waiting for a grid on UL/guard slots, where none is ever produced.
+  bool is_dl_enabled(slot_point_extended slot) const
+  {
+    if (dl_symbols_per_slot_lst.empty()) {
+      return true;
+    }
+    return dl_symbols_per_slot_lst[slot.system_slot() % dl_symbols_per_slot_lst.size()] > 0;
+  }
+
   /// Scaling factor for converting from complex float to 16-bit complex integer.
   static constexpr float scaling_factor_cf_to_ci16 = std::numeric_limits<int16_t>::max();
 
@@ -233,6 +249,8 @@ private:
   // from a slot's on_tti_boundary notification to when its grid is processed, i.e. the realized M-slot offset.
   // M2 (event-driven / fractional M) reduces this. Phone-independent. ----
   void dlp_update(unsigned i_slot);
+  void dlp_init();
+  void dlp_record(uint64_t lat_us);
   std::array<uint64_t, 256> dlp_notify_ns{};
   double                    dlp_period_s = -1.0;
   std::vector<uint32_t>     dlp_hist;
@@ -242,6 +260,21 @@ private:
   baseband_gateway_buffer_pool buffer_pool;
   /// Previous reported slot.
   std::optional<slot_point_extended> previous_slot;
+  // ---- M2 (event-driven downlink, aygong/srsRAN_Project_Low_Latency): instead of pre-fetching the modulated grid a
+  // whole slot in advance (nof_slot_tti_in_advance quantization), notify at M=0 and busy-wait within process() for the
+  // grid to be modulated and handed over through the PDxCH requests pool, bounded to one slot and gated to DL slots.
+  // All three knobs are read once from the environment; unset => stock behavior. ----
+  /// Enables the event-driven busy-wait. Env OCUDU_LPHY_EVENT_DRIVEN_DL.
+  bool event_driven_dl = false;
+  /// Poll interval of the busy-wait, in microseconds. Env OCUDU_LPHY_EVENT_DRIVEN_POLL_US (default 10).
+  unsigned event_driven_poll_us = 10;
+  /// Maximum busy-wait per slot, in microseconds. Env OCUDU_LPHY_EVENT_DRIVEN_MAX_US (default: one slot). Bounding this
+  /// below a slot limits the lead consumed by idle DL slots, where no grid is ever produced.
+  unsigned event_driven_max_us = 0;
+  /// Slot duration in microseconds.
+  unsigned slot_duration_us = 0;
+  /// Per-slot count of active DL symbols over one TDD period, circularly indexed by system slot. Empty in FDD.
+  std::vector<unsigned> dl_symbols_per_slot_lst;
 };
 
 } // namespace ocudu

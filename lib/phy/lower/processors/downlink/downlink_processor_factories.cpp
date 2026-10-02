@@ -35,7 +35,8 @@ public:
                                                                  .rate         = config.rate,
                                                                  .nof_tx_ports = config.nof_tx_ports,
                                                                  .nof_slot_tti_in_advance =
-                                                                     config.nof_slot_tti_in_advance};
+                                                                     config.nof_slot_tti_in_advance,
+                                                                 .tdd_ul_dl_cfg_common = config.tdd_ul_dl_cfg_common};
 
     return std::make_unique<downlink_processor_impl>(pdxch_proc_factory->create(pdxch_proc_config, modulation_executor),
                                                      baseband_config);

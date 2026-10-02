@@ -18,7 +18,7 @@ start_gnb(){
   timeout 20 sudo pkill -INT -x gnb; for i in $(seq 15); do pgrep -x gnb >/dev/null||break; sleep 1; done; pgrep -x gnb >/dev/null && timeout 10 sudo pkill -9 -x gnb; sleep 1
   [ -s $L ] && cp $L $C/gnb_hwtimed_console.prev.log
   sudo rm -f /tmp/ocudu_soapy_rx_ts_shift
-  timeout 20 sudo -b sh -c "env OCUDU_SOAPY_RX_TS_SHIFT=$SHIFT nohup $B/apps/gnb/gnb -c $CFG > $L 2>&1 < /dev/null"
+  timeout 20 sudo -b sh -c "env OCUDU_SOAPY_RX_TS_SHIFT=$SHIFT $EXTRA_ENV nohup $B/apps/gnb/gnb -c $CFG > $L 2>&1 < /dev/null"
   sleep 20; log "gNB started (shift $SHIFT, cfg $(basename $CFG)): $(pgrep -x gnb >/dev/null && echo up || echo FAILED)"
 }
 # The gNB warns that DRM KMS connector polling "may hinder performance"; disable it (reversible, resets
