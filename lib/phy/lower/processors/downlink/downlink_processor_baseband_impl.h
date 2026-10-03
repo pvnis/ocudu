@@ -275,6 +275,14 @@ private:
   unsigned slot_duration_us = 0;
   /// Per-slot count of active DL symbols over one TDD period, circularly indexed by system slot. Empty in FDD.
   std::vector<unsigned> dl_symbols_per_slot_lst;
+  // ---- Busy-wait accounting (reported alongside the M-offset stats): documents the instability mechanism at small H.
+  // A DL slot whose grid is not ready at the boundary enters the busy-wait; if no grid ever arrives (an idle DL slot,
+  // e.g. no PDSCH scheduled) it spins to the cap and that full wait is pure lead burn. Counting entries vs timeouts and
+  // the time burned shows exactly how much of the (H-dependent) TX lead the busy-wait consumes. ----
+  uint64_t ed_entries     = 0;  ///< DL slots that entered the busy-wait (grid not ready at the boundary).
+  uint64_t ed_timeouts    = 0;  ///< of those, that hit the cap with no grid (full lead burn).
+  uint64_t ed_wait_sum_us = 0;  ///< total time spent in the busy-wait this report period.
+  uint64_t ed_wait_max_us = 0;  ///< worst single busy-wait this report period.
 };
 
 } // namespace ocudu

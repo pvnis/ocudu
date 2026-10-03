@@ -204,11 +204,25 @@ downlink_processor_baseband_impl::process(baseband_gateway_timestamp timestamp)
     // modulated grid over through the PDxCH requests pool (picked up by re-reading process_slot). Bounded in time and
     // restricted to DL slots: UL/guard slots never produce a grid, so waiting there would only burn the DL lead.
     if (event_driven_dl && !pdxch_baseband_result.buffer && is_dl_enabled(slot)) {
-      const auto deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(event_driven_max_us);
+      const auto t_wait0  = std::chrono::steady_clock::now();
+      const auto deadline = t_wait0 + std::chrono::microseconds(event_driven_max_us);
       while (!pdxch_baseband_result.buffer && (std::chrono::steady_clock::now() < deadline)) {
         std::this_thread::sleep_for(std::chrono::microseconds(event_driven_poll_us));
         pdxch_baseband_result =
             pdxch_proc_baseband.process_slot({.slot = slot.without_hyper_sfn(), .sector = sector_id});
+      }
+      // Account for the time the busy-wait burned. A timeout (no grid) on an idle DL slot is pure TX-lead burn, which
+      // is what destabilizes small H (the H-dependent lead cannot absorb it).
+      if (dlp_period_s > 0.0) {
+        const uint64_t w = std::chrono::duration_cast<std::chrono::microseconds>(
+                               std::chrono::steady_clock::now() - t_wait0)
+                               .count();
+        ++ed_entries;
+        if (!pdxch_baseband_result.buffer) {
+          ++ed_timeouts;
+        }
+        ed_wait_sum_us += w;
+        ed_wait_max_us = std::max(ed_wait_max_us, w);
       }
     }
 
@@ -340,8 +354,18 @@ void downlink_processor_baseband_impl::dlp_record(uint64_t lat_us)
                "gNB DL M-offset (notify->process, us): M=%u n=%llu min=%llu p50=%lld p90=%lld p99=%lld p99.9=%lld max=%llu\n",
                M, (unsigned long long)dlp_n, (unsigned long long)dlp_min, pct[0], pct[1], pct[2], pct[3],
                (unsigned long long)dlp_max);
+  if (event_driven_dl) {
+    // Busy-wait accounting: entries = DL slots that had to wait; timeouts = idle DL slots that burned the full cap
+    // (pure TX-lead burn, the destabilizer at small H); avg/max = how much lead the busy-wait consumes per entry.
+    const double avg = ed_entries ? static_cast<double>(ed_wait_sum_us) / static_cast<double>(ed_entries) : 0.0;
+    std::fprintf(stderr,
+                 "gNB M2 busy-wait: entries=%llu timeouts=%llu (cap=%u us) avg=%.0f us max=%llu us total=%llu us/period\n",
+                 (unsigned long long)ed_entries, (unsigned long long)ed_timeouts, event_driven_max_us, avg,
+                 (unsigned long long)ed_wait_max_us, (unsigned long long)ed_wait_sum_us);
+  }
   std::fflush(stderr);
   std::fill(dlp_hist.begin(), dlp_hist.end(), 0);
   dlp_n = 0;
   dlp_t0 = now;
+  ed_entries = ed_timeouts = ed_wait_sum_us = ed_wait_max_us = 0;
 }
