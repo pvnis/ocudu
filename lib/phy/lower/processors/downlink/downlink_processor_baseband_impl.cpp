@@ -58,6 +58,11 @@ downlink_processor_baseband_impl::downlink_processor_baseband_impl(
   if (const char* env = std::getenv("OCUDU_LPHY_EVENT_DRIVEN_MAX_US")) {
     event_driven_max_us = static_cast<unsigned>(std::min<long>(slot_duration_us, std::max(1L, std::strtol(env, nullptr, 10))));
   }
+  if (const char* env = std::getenv("OCUDU_LPHY_EVENT_DRIVEN_GRACE_US")) {
+    event_driven_grace_us = static_cast<unsigned>(std::min<long>(event_driven_max_us, std::max(1L, std::strtol(env, nullptr, 10))));
+  } else {
+    event_driven_grace_us = std::min(event_driven_grace_us, event_driven_max_us);
+  }
   // Optional override of the DL TTI-in-advance (M). max_processing_delay_slots has a CLI minimum of 1; this env allows
   // M=0, which is the event-driven operating point (notify the current slot, then busy-wait for its grid).
   if (const char* env = std::getenv("OCUDU_LPHY_DL_TTI_IN_ADVANCE")) {
@@ -78,9 +83,11 @@ downlink_processor_baseband_impl::downlink_processor_baseband_impl(
 
   if (event_driven_dl) {
     std::fprintf(stderr,
-                 "gNB M2 event-driven DL: enabled (M=%u, poll=%u us, max_wait=%u us, slot=%u us, tdd_dl_slots_known=%d)\n",
+                 "gNB M2 event-driven DL: enabled (M=%u, poll=%u us, grace=%u us, max_wait=%u us, slot=%u us, "
+                 "tdd_dl_slots_known=%d)\n",
                  nof_slot_tti_in_advance,
                  event_driven_poll_us,
+                 event_driven_grace_us,
                  event_driven_max_us,
                  slot_duration_us,
                  static_cast<int>(!dl_symbols_per_slot_lst.empty()));
@@ -204,25 +211,50 @@ downlink_processor_baseband_impl::process(baseband_gateway_timestamp timestamp)
     // modulated grid over through the PDxCH requests pool (picked up by re-reading process_slot). Bounded in time and
     // restricted to DL slots: UL/guard slots never produce a grid, so waiting there would only burn the DL lead.
     if (event_driven_dl && !pdxch_baseband_result.buffer && is_dl_enabled(slot)) {
-      const auto t_wait0  = std::chrono::steady_clock::now();
-      const auto deadline = t_wait0 + std::chrono::microseconds(event_driven_max_us);
-      while (!pdxch_baseband_result.buffer && (std::chrono::steady_clock::now() < deadline)) {
+      const slot_point sp             = slot.without_hyper_sfn();
+      const auto       t_wait0        = std::chrono::steady_clock::now();
+      const auto       grace_deadline = t_wait0 + std::chrono::microseconds(event_driven_grace_us);
+      const auto       hard_deadline  = t_wait0 + std::chrono::microseconds(event_driven_max_us);
+      // Only keep spinning once a transmission request has actually been handed in for this slot. If none appears
+      // within the grace window the slot is idle (no PDSCH scheduled) and we stop, so idle DL slots burn at most the
+      // grace of the TX lead instead of the full cap. Once a request is seen, wait up to the cap for modulation.
+      bool     seen        = false;
+      uint64_t seen_lat_us = 0;
+      while (!pdxch_baseband_result.buffer) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= hard_deadline) {
+          break;
+        }
+        if (!seen) {
+          if (pdxch_proc_baseband.request_seen(sp)) {
+            seen        = true;
+            seen_lat_us = std::chrono::duration_cast<std::chrono::microseconds>(now - t_wait0).count();
+          } else if (now >= grace_deadline) {
+            break; // idle DL slot: no request within the grace window.
+          }
+        }
         std::this_thread::sleep_for(std::chrono::microseconds(event_driven_poll_us));
-        pdxch_baseband_result =
-            pdxch_proc_baseband.process_slot({.slot = slot.without_hyper_sfn(), .sector = sector_id});
+        pdxch_baseband_result = pdxch_proc_baseband.process_slot({.slot = sp, .sector = sector_id});
       }
-      // Account for the time the busy-wait burned. A timeout (no grid) on an idle DL slot is pure TX-lead burn, which
-      // is what destabilizes small H (the H-dependent lead cannot absorb it).
+      // Accounting: idle_stops = stopped at grace with no request (bounded idle burn); timeouts = request seen but
+      // modulation did not finish by the cap; seen latency tunes the grace window.
       if (dlp_period_s > 0.0) {
         const uint64_t w = std::chrono::duration_cast<std::chrono::microseconds>(
                                std::chrono::steady_clock::now() - t_wait0)
                                .count();
         ++ed_entries;
-        if (!pdxch_baseband_result.buffer) {
-          ++ed_timeouts;
-        }
         ed_wait_sum_us += w;
         ed_wait_max_us = std::max(ed_wait_max_us, w);
+        if (seen) {
+          ++ed_seen_count;
+          ed_seen_sum_us += seen_lat_us;
+          ed_seen_max_us = std::max(ed_seen_max_us, seen_lat_us);
+          if (!pdxch_baseband_result.buffer) {
+            ++ed_timeouts;
+          }
+        } else {
+          ++ed_idle_stops;
+        }
       }
     }
 
@@ -355,17 +387,23 @@ void downlink_processor_baseband_impl::dlp_record(uint64_t lat_us)
                M, (unsigned long long)dlp_n, (unsigned long long)dlp_min, pct[0], pct[1], pct[2], pct[3],
                (unsigned long long)dlp_max);
   if (event_driven_dl) {
-    // Busy-wait accounting: entries = DL slots that had to wait; timeouts = idle DL slots that burned the full cap
-    // (pure TX-lead burn, the destabilizer at small H); avg/max = how much lead the busy-wait consumes per entry.
-    const double avg = ed_entries ? static_cast<double>(ed_wait_sum_us) / static_cast<double>(ed_entries) : 0.0;
+    // Busy-wait accounting. entries = DL slots that had to wait; idle_stops = stopped at the grace window with no
+    // request (bounded idle burn = the fix); timeouts = request seen but modulation missed the cap; avg/max = lead
+    // the busy-wait consumes per entry; seen = notify->request latency (tunes the grace window).
+    const double avg      = ed_entries ? static_cast<double>(ed_wait_sum_us) / static_cast<double>(ed_entries) : 0.0;
+    const double seen_avg = ed_seen_count ? static_cast<double>(ed_seen_sum_us) / static_cast<double>(ed_seen_count) : 0.0;
     std::fprintf(stderr,
-                 "gNB M2 busy-wait: entries=%llu timeouts=%llu (cap=%u us) avg=%.0f us max=%llu us total=%llu us/period\n",
-                 (unsigned long long)ed_entries, (unsigned long long)ed_timeouts, event_driven_max_us, avg,
-                 (unsigned long long)ed_wait_max_us, (unsigned long long)ed_wait_sum_us);
+                 "gNB M2 busy-wait: entries=%llu idle_stops=%llu timeouts=%llu (grace=%u cap=%u us) avg=%.0f max=%llu "
+                 "total=%llu us/period | seen: n=%llu avg=%.0f max=%llu us\n",
+                 (unsigned long long)ed_entries, (unsigned long long)ed_idle_stops, (unsigned long long)ed_timeouts,
+                 event_driven_grace_us, event_driven_max_us, avg, (unsigned long long)ed_wait_max_us,
+                 (unsigned long long)ed_wait_sum_us, (unsigned long long)ed_seen_count, seen_avg,
+                 (unsigned long long)ed_seen_max_us);
   }
   std::fflush(stderr);
   std::fill(dlp_hist.begin(), dlp_hist.end(), 0);
   dlp_n = 0;
   dlp_t0 = now;
-  ed_entries = ed_timeouts = ed_wait_sum_us = ed_wait_max_us = 0;
+  ed_entries = ed_idle_stops = ed_timeouts = ed_wait_sum_us = ed_wait_max_us = 0;
+  ed_seen_sum_us = ed_seen_max_us = ed_seen_count = 0;
 }

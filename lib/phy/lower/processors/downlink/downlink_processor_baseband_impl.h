@@ -268,9 +268,15 @@ private:
   bool event_driven_dl = false;
   /// Poll interval of the busy-wait, in microseconds. Env OCUDU_LPHY_EVENT_DRIVEN_POLL_US (default 10).
   unsigned event_driven_poll_us = 10;
-  /// Maximum busy-wait per slot, in microseconds. Env OCUDU_LPHY_EVENT_DRIVEN_MAX_US (default: one slot). Bounding this
-  /// below a slot limits the lead consumed by idle DL slots, where no grid is ever produced.
+  /// Maximum busy-wait per slot, in microseconds. Env OCUDU_LPHY_EVENT_DRIVEN_MAX_US (default: one slot). Once a request
+  /// is seen, the busy-wait spins up to this to let modulation complete.
   unsigned event_driven_max_us = 0;
+  /// \brief Grace window, in microseconds, for a request to appear before concluding the DL slot is idle.
+  ///
+  /// Env OCUDU_LPHY_EVENT_DRIVEN_GRACE_US (default 200). If no transmission request is seen within this window the slot
+  /// is treated as idle and the busy-wait stops, so idle DL slots burn at most this (not the full cap) of the TX lead.
+  /// Must exceed the notify->request latency (reported as "seen" avg/max in the stats) or real grids get dropped.
+  unsigned event_driven_grace_us = 200;
   /// Slot duration in microseconds.
   unsigned slot_duration_us = 0;
   /// Per-slot count of active DL symbols over one TDD period, circularly indexed by system slot. Empty in FDD.
@@ -280,9 +286,13 @@ private:
   // e.g. no PDSCH scheduled) it spins to the cap and that full wait is pure lead burn. Counting entries vs timeouts and
   // the time burned shows exactly how much of the (H-dependent) TX lead the busy-wait consumes. ----
   uint64_t ed_entries     = 0;  ///< DL slots that entered the busy-wait (grid not ready at the boundary).
-  uint64_t ed_timeouts    = 0;  ///< of those, that hit the cap with no grid (full lead burn).
+  uint64_t ed_idle_stops  = 0;  ///< of those, stopped at the grace window with no request (idle DL slots).
+  uint64_t ed_timeouts    = 0;  ///< of those, saw a request but modulation did not finish by the cap.
   uint64_t ed_wait_sum_us = 0;  ///< total time spent in the busy-wait this report period.
   uint64_t ed_wait_max_us = 0;  ///< worst single busy-wait this report period.
+  uint64_t ed_seen_sum_us = 0;  ///< sum of notify->request-seen latency (to tune the grace window).
+  uint64_t ed_seen_max_us = 0;  ///< worst notify->request-seen latency.
+  uint64_t ed_seen_count  = 0;  ///< number of slots where a request was seen.
 };
 
 } // namespace ocudu

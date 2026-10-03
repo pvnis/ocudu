@@ -76,16 +76,59 @@ exceed (worst-case busy-wait burn + host jitter); H=1's budget is too small.
 - **(B) `sleep_for` overshoot.** The poll sleep overshoots the cap under load
   (max 487 µs vs a 300 µs cap), so even the bounded wait is not actually bounded.
 
-## Fix directions (not yet implemented)
+## Fix implemented: the grant-present hint
 
-- Bound the idle burn hard: a much smaller cap *and* a busy-spin (`pause`/`yield`)
-  instead of `sleep_for`, so the wait cannot overshoot. Trades a little CPU for a
-  deterministic bound.
-- Skip the wait on slots the MAC did not populate: pass a per-slot "DL grant present"
-  hint from the MAC/scheduler down to the lower PHY so the busy-wait only arms on slots
-  that actually carry a grid (removes the 83 % idle-slot burn entirely).
-- Keep H ≥ 2 and accept M2's clean operating point (DL ~3.95 ms p50 on this UE); H only
-  helps at H=1, which this host's jitter cannot support.
+Root cause (A) — busy-waiting on idle DL slots — is addressed by a per-slot
+**grant-present hint**. `pdxch_processor_impl::handle_request` marks the slot of each
+non-empty transmission request (`request_seen_marker`, before enqueuing modulation);
+`pdxch_processor_baseband::request_seen(slot)` exposes it. The busy-wait then uses:
+
+- a short **grace** window (`OCUDU_LPHY_EVENT_DRIVEN_GRACE_US`, default 200) for a
+  request to appear — if none does, the slot is idle and the wait stops; and
+- the full **cap** (`..._MAX_US`) for modulation to finish *once a request is seen*.
+
+This decouples "wait for the grant to show up" (short; idle slots stop here) from "wait
+for modulation once granted" (full cap; real grids never clipped). The stats line gains
+`idle_stops` and a `seen:` latency (notify->request) to tune the grace.
+
+### Measured effect (H=1)
+
+Idle, grace=150, cap=300:
+
+    entries=15001 idle_stops=12438 timeouts=0 avg=139 (was 266) total=2.08M (was 3.98M) | seen: avg=39 max=140 us
+    RF-fail 164 -> 0, TX lead min 70 -> ~200 us
+
+The hint works: idle burn roughly halved, `timeouts=0`, RF-fail eliminated at idle.
+
+**But H=1 is still not clean under load**, and tuning the grace is a lose-lose:
+
+| grace | false idle-stops           | idle burn | RF-fail/load | probe loss |
+|-------|----------------------------|-----------|--------------|------------|
+| 150   | yes (seen max 156 > 150)   | 139 us    | 36           | 22/500     |
+| 220   | no  (seen max 141 < 220)   | 194 us    | 42           | 50/500     |
+
+- low grace -> real grants arriving after the grace are dropped (false idle-stop);
+- high grace -> more lead burned per idle slot -> more gate-late.
+
+### Why H=1 cannot be rescued (the budget)
+
+The decisive datum: at M=0 the DL grant is not available until **~140 us** (max ~156 us
+under load) after the slot boundary — the upper-PHY schedule->FAPI->grid path
+(`seen: avg ~45 / max ~156 us`). The H=1 TX lead is only ~437 us, and it must cover
+
+    grant delivery (~140 us) + idle-slot grace burn (~150-220 us) + modulation + SMI jitter (~224 us)
+
+which overflows. **H=1 + M=0 is physically incompatible on this upper PHY** — a lead
+budget, not a bug. The grant hint cannot manufacture lead that H=1 does not have.
+
+At H=2 (lead ~938 us) and H=3 (~1444 us) the same terms fit, so M2 is clean there. The
+grant hint remains worthwhile at any H (less wasted CPU, `timeouts=0`).
+
+### Remaining options to actually reach H=1 (not pursued)
+
+- Reduce the ~140 us grant-delivery latency (upper-PHY DL path) so it fits a small lead.
+- Reduce host SMI jitter below ~50 us (firmware/BIOS; hwlat shows ~224 us spikes).
+- Accept H=2/H=3 + M2 as the clean floor (DL ~3.95 ms p50 on this UE).
 
 ## The 2 ms question
 
@@ -103,7 +146,8 @@ gNB should reach ~2 ms cleanly — the gNB side is no longer the bottleneck; the
 | `OCUDU_LPHY_EVENT_DRIVEN_DL` | enable the M2 busy-wait | off |
 | `OCUDU_LPHY_DL_TTI_IN_ADVANCE` | override M (0 = event-driven) | = max_proc_delay |
 | `OCUDU_LPHY_EVENT_DRIVEN_POLL_US` | busy-wait poll interval | 10 |
-| `OCUDU_LPHY_EVENT_DRIVEN_MAX_US` | busy-wait cap per slot | one slot |
+| `OCUDU_LPHY_EVENT_DRIVEN_GRACE_US` | grace for a request to appear before a DL slot is deemed idle | 200 |
+| `OCUDU_LPHY_EVENT_DRIVEN_MAX_US` | busy-wait cap per slot (modulation wait once a request is seen) | one slot |
 | `OCUDU_DL_PIPELINE_STATS` | report period (s) for M-offset + busy-wait stats | off |
 
 `scripts/m2sdr/guardian_hw.sh` passes these through via its `EXTRA_ENV` variable.

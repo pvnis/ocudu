@@ -42,6 +42,12 @@ void pdxch_processor_impl::handle_request(const shared_resource_grid& grid, cons
     return;
   }
 
+  // Mark that a non-empty transmission request has been received for this slot, so the event-driven downlink busy-wait
+  // knows this is a DL slot that will carry a grid (as opposed to an idle DL slot). Set before enqueuing modulation so
+  // the hint is visible as soon as the grant arrives, ahead of the modulated samples.
+  request_seen_marker[context.slot.system_slot() % request_seen_size].store(context.slot.system_slot() + 1,
+                                                                            std::memory_order_relaxed);
+
   // Obtain baseband buffer.
   baseband_gateway_buffer_ptr buffer = bb_buffers.get();
   if (!buffer) {
@@ -79,6 +85,12 @@ bool pdxch_processor_impl::set_carrier_center_frequency(double carrier_center_fr
 {
   common_ofdm_modulator->set_center_frequency(carrier_center_frequency_Hz);
   return true;
+}
+
+bool pdxch_processor_impl::request_seen(slot_point slot)
+{
+  return request_seen_marker[slot.system_slot() % request_seen_size].load(std::memory_order_relaxed) ==
+         slot.system_slot() + 1;
 }
 
 pdxch_processor_baseband::slot_result pdxch_processor_impl::process_slot(slot_context context)

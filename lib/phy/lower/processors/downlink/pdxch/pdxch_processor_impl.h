@@ -17,6 +17,8 @@
 #include "ocudu/phy/lower/processors/lower_phy_center_freq_controller.h"
 #include "ocudu/phy/support/resource_grid_context.h"
 #include "ocudu/support/memory_pool/bounded_object_pool.h"
+#include <array>
+#include <atomic>
 
 namespace ocudu {
 
@@ -108,6 +110,9 @@ private:
   // See pdxch_processor_baseband interface for documentation.
   pdxch_processor_baseband::slot_result process_slot(slot_context context) override;
 
+  // See pdxch_processor_baseband interface for documentation.
+  bool request_seen(slot_point slot) override;
+
   // See pdxch_processor_request_handler interface for documentation.
   void handle_request(const shared_resource_grid& grid, const resource_grid_context& context) override;
 
@@ -133,6 +138,13 @@ private:
   std::vector<std::unique_ptr<pdxch_baseband_modulator>> modulators;
   /// Circular concurrent pool of transmit requests.
   buffer_request_pool requests;
+  /// \brief Per-slot marker of received (non-empty) transmission requests, for request_seen().
+  ///
+  /// Indexed by system slot modulo the array size; each entry stores (system_slot + 1) of the last request handed in
+  /// at that index, so a stale marker from an earlier cycle never matches the current slot. Written by handle_request
+  /// (any thread), read by request_seen on the downlink baseband thread.
+  static constexpr unsigned request_seen_size = 32;
+  std::array<std::atomic<uint32_t>, request_seen_size> request_seen_marker{};
 };
 
 } // namespace ocudu

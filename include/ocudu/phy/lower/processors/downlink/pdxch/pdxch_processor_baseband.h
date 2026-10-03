@@ -41,6 +41,17 @@ public:
   /// \param[in] context OFDM Symbol context.
   /// \return Slot downlink baseband results.
   virtual slot_result process_slot(slot_context context) = 0;
+
+  /// \brief Indicates whether a (non-empty) transmission request has been received for the given slot.
+  ///
+  /// Used by the M2 event-driven downlink busy-wait to tell a DL slot that will carry a grid apart from an idle DL
+  /// slot: the busy-wait only keeps spinning for the modulated grid once a request has actually been handed in, so it
+  /// does not burn the transmit lead on idle slots. The default returns \c true (assume a grid is coming), preserving
+  /// the previous always-wait behavior for implementations that do not provide the hint.
+  ///
+  /// \param[in] slot Slot being processed.
+  /// \return True if a transmission request for \c slot has been received, false otherwise.
+  virtual bool request_seen(slot_point slot) { return true; }
 };
 
 } // namespace ocudu
