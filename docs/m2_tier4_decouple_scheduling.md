@@ -1,5 +1,44 @@
 # Tier-4 plan: decouple scheduling-lead from the PHY pull (robustly clean H=1)
 
+## UPDATE (2026-10-04): the decouple idea does NOT hold — implemented as fractional H instead
+
+Tracing the code before implementing killed the premise below. In
+`downlink_processor_baseband_impl::process()` the **pull is always the current slot**
+(`process_slot(slot)`); `nof_slot_tti_in_advance` (M) only shifts the **notify**
+(`on_tti_boundary(slot + M)`). There is only one timeline knob — *when the MAC is asked
+to schedule* — and notify→pull = M×0.5 ms. So a `sched_lead` ≥ 1 is not a decouple; it is
+exactly M=1 and gives back the 0.5 ms M2 bought. And a "fast empty-slot signal" doesn't
+help either: at M=0 the MAC's dl_tti_request (even an empty one) only arrives ~140 µs
+after the notify — that IS the scheduler+FAPI decision latency, and it can't be known
+sooner without scheduling earlier (= M≥1 = the latency back). The ~140 µs is irreducible
+at M=0 from the lower PHY; the only way to lower it is to speed up the MAC/FAPI path
+itself (a separate upper-PHY effort).
+
+**What we did instead — fractional H (the lead-budget knee).** Rather than remove the
+~140 µs, give the event-driven pipeline *just enough lead* to absorb it. `H`
+(`radio_heads_prep_time`) is now a float (`OCUDU_LPHY_RADIO_HEADS_PREP_TIME`,
+`lower_phy_factory.cpp`): `rx_to_tx_max_delay = srate_kHz·(H−1)/slots_per_sf + tx_offset`,
+so H between 1 and 2 sets a sub-slot lead. Swept at M=0 + busy-spin + grace=200 on
+isolated cores:
+
+| H   | TX lead (idle) | RF-fail (load) | DL one-way min |
+|-----|----------------|----------------|----------------|
+| 1.0 | ~230 µs        | 5              | 2.20 ms        |
+| 1.3 | ~400 µs        | 2              | 2.56 ms        |
+| 1.4 | ~510 µs        | **0**          | **2.82 ms**    |
+| 1.5 | ~616 µs        | 0              | 2.85 ms        |
+| 2.0 | ~938 µs        | 0              | 3.33 ms        |
+
+**The clean knee is H≈1.4** — 0 gate-late under load at DL one-way min ~2.82 ms, ~0.5 ms
+below H=2 and clean where H=1 was not. H=1.5 is the same with more margin. (p50/loss are
+COTS-channel noise per attach; min and RF-fail are the reliable, phone-independent-ish
+signals.) Recommended: **H=1.5 operational** (clean + margin), pending a longer soak;
+H=1.4 is the aggressive edge. To go below ~2.8 ms cleanly needs the MAC/FAPI ~140 µs
+reduced (option 2 below) or the SIM8200 UE.
+
+Everything below is the ORIGINAL plan, kept for the reasoning that led here; the
+`sched_lead` approach itself is superseded by fractional H.
+
 ## Problem recap
 
 M2 (event-driven downlink) drives the PHY notify to the current slot (M=0) and

@@ -4,6 +4,7 @@
 
 #include "ocudu/phy/lower/lower_phy_factory.h"
 #include "lower_phy_impl.h"
+#include <cstdio>
 #include <cstdlib>
 
 using namespace ocudu;
@@ -131,14 +132,24 @@ public:
 
     // ---- M1 (radio_heads_prep_time = H-slot offset, aygong/srsRAN_Project_Low_Latency): the DL preparation
     // lead relative to the radio. rx_to_tx_max_delay = srate_kHz * (H-1)/slots_per_subframe + tx_offset.
-    // H=3 reproduces the stock 1 ms lead; H=1 gives the minimal lead (DL generated just-in-time). ----
-    unsigned radio_heads_prep_time = 3;
+    // H=3 reproduces the stock 1 ms lead; H=1 gives the minimal lead (DL generated just-in-time).
+    // H is FRACTIONAL (Tier-4): a value between 1 and 2 sets a sub-slot lead to find the stability knee for the
+    // event-driven DL (M=0) - just enough lead to absorb the MAC grant-delivery + modulation + host jitter without
+    // paying a full extra slot of latency. ----
+    double radio_heads_prep_time = 3.0;
     if (const char* env = std::getenv("OCUDU_LPHY_RADIO_HEADS_PREP_TIME")) {
-      radio_heads_prep_time = static_cast<unsigned>(std::max(1L, std::strtol(env, nullptr, 10)));
+      radio_heads_prep_time = std::max(1.0, std::strtod(env, nullptr));
     }
     const unsigned slots_per_subframe = pow2(to_numerology_value(config.scs));
     const unsigned rx_to_tx_delay_m1 =
-        config.srate.to_kHz() * (radio_heads_prep_time - 1) / slots_per_subframe + static_cast<unsigned>(tx_time_offset);
+        static_cast<unsigned>(config.srate.to_kHz() * (radio_heads_prep_time - 1.0) / slots_per_subframe) +
+        static_cast<unsigned>(tx_time_offset);
+    std::fprintf(stderr,
+                 "gNB M1 prepare-lead: H=%.2f -> rx_to_tx_max_delay=%u samples (~%.0f us) + tx_offset\n",
+                 radio_heads_prep_time,
+                 rx_to_tx_delay_m1,
+                 1000.0 * rx_to_tx_delay_m1 / config.srate.to_kHz());
+    std::fflush(stderr);
 
     // Prepare processor baseband adaptor configuration.
     lower_phy_baseband_processor_configuration proc_bb_adaptor_config = {
