@@ -18,7 +18,11 @@ start_gnb(){
   timeout 20 sudo pkill -INT -x gnb; for i in $(seq 15); do pgrep -x gnb >/dev/null||break; sleep 1; done; pgrep -x gnb >/dev/null && timeout 10 sudo pkill -9 -x gnb; sleep 1
   [ -s $L ] && cp $L $C/gnb_hwtimed_console.prev.log
   sudo rm -f /tmp/ocudu_soapy_rx_ts_shift
-  timeout 20 sudo -b sh -c "env OCUDU_SOAPY_RX_TS_SHIFT=$SHIFT $EXTRA_ENV nohup $B/apps/gnb/gnb -c $CFG > $L 2>&1 < /dev/null"
+  # GNB_CPUS: with isolcpus the process must be launched with an affinity that SPANS the isolated
+  # cores, or the gNB sees only the housekeeping CPUs and under-provisions its pools (the lower PHY
+  # collapses to a single rx+tx thread and falls ~100s of ms behind). Pin it to the isolated cores.
+  TS=""; [ -n "${GNB_CPUS:-}" ] && TS="taskset -c $GNB_CPUS "
+  timeout 20 sudo -b sh -c "env OCUDU_SOAPY_RX_TS_SHIFT=$SHIFT $EXTRA_ENV nohup ${TS}$B/apps/gnb/gnb -c $CFG > $L 2>&1 < /dev/null"
   sleep 20; log "gNB started (shift $SHIFT, cfg $(basename $CFG)): $(pgrep -x gnb >/dev/null && echo up || echo FAILED)"
 }
 # The gNB warns that DRM KMS connector polling "may hinder performance"; disable it (reversible, resets
