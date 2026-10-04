@@ -124,11 +124,38 @@ budget, not a bug. The grant hint cannot manufacture lead that H=1 does not have
 At H=2 (lead ~938 us) and H=3 (~1444 us) the same terms fit, so M2 is clean there. The
 grant hint remains worthwhile at any H (less wasted CPU, `timeouts=0`).
 
-### Remaining options to actually reach H=1 (not pursued)
+### Busy-spin option (OCUDU_LPHY_EVENT_DRIVEN_POLL_US=0)
 
-- Reduce the ~140 us grant-delivery latency (upper-PHY DL path) so it fits a small lead.
-- Reduce host SMI jitter below ~50 us (firmware/BIOS; hwlat shows ~224 us spikes).
-- Accept H=2/H=3 + M2 as the clean floor (DL ~3.95 ms p50 on this UE).
+`sleep_for` overshoots the cap/grace under scheduler contention (max 487 us for a 300 us
+cap). Setting the poll interval to 0 switches the wait to a tight PAUSE busy-spin that
+re-checks `steady_clock` each iteration, so the deadline is honored to sub-us.
+**Only safe with CPU isolation** (a dedicated core): without `isolcpus` the spinning
+FIFO TX thread can starve the lower-priority modulation thread if they share a core
+(RT throttle is also removed by the tuning), so the grid never arrives and the slot is
+lost. Use poll>0 (sleep) until the PHY cores are isolated.
+
+### Host determinism tuning (scripts/ocudu_lowlat_tune.sh)
+
+Applying the full low-jitter tuning (cpu_dma_latency=0, RT-throttle off, IRQ affinity,
+watchdog/timer off, Wi-Fi power-save off; isolcpus staged for reboot) measurably cut the
+jitter: RX-lag max 199 -> ~22 us. At H=1 under load it improved the DL *latency*
+(p50 3.6 -> 2.90 ms, min 2.20 ms, fewer lost) **but did not reduce the gate-late**
+(~38 RF-fail, unchanged). This confirms the H=1 overflow is dominated by the ~140 us
+upper-PHY grant-delivery latency, not host jitter — host tuning tightens the
+distribution but cannot create lead.
+
+### Remaining options to actually reach H=1 (ranked)
+
+1. **Decouple scheduling from the PHY pull (Tier 4):** notify the MAC one slot early so
+   the grant is already in flight, but keep the sample pull event-driven. Removes the
+   ~140 us grant-delivery latency from the busy-wait budget - the only change that
+   attacks the dominant term. Upper-PHY work (splits the single M knob).
+2. `isolcpus` + busy-spin (poll=0): removes preemption and sleep overshoot; helps the
+   tail, does not remove the grant latency. Staged in GRUB; needs a reboot + --pin-threads.
+3. Reduce host SMI jitter below ~50 us (firmware/BIOS; a laptop i7-9750H cannot - this is
+   the platform ceiling).
+4. Accept H=2/H=3 + M2 as the clean floor (DL ~3.95 ms p50 on this UE); use the SIM8200
+   UE for the paper's 2 ms, which needs neither H=1 nor the risk.
 
 ## The 2 ms question
 

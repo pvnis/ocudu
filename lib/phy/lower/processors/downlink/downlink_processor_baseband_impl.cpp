@@ -18,6 +18,17 @@
 
 using namespace ocudu;
 
+/// CPU relax hint for the event-driven busy-spin: PAUSE on x86 (short, power-friendly, no scheduler yield), so the
+/// busy-wait never oversleeps the way std::this_thread::sleep_for does under scheduler contention.
+static inline void ed_cpu_relax()
+{
+#if defined(__x86_64__) || defined(__i386__)
+  __builtin_ia32_pause();
+#else
+  std::this_thread::yield();
+#endif
+}
+
 downlink_processor_baseband_impl::downlink_processor_baseband_impl(
     pdxch_processor_baseband&                        pdxch_proc_baseband_,
     const downlink_processor_baseband_configuration& config) :
@@ -52,7 +63,8 @@ downlink_processor_baseband_impl::downlink_processor_baseband_impl(
     event_driven_dl = (std::strtol(env, nullptr, 10) != 0);
   }
   if (const char* env = std::getenv("OCUDU_LPHY_EVENT_DRIVEN_POLL_US")) {
-    event_driven_poll_us = static_cast<unsigned>(std::max(1L, std::strtol(env, nullptr, 10)));
+    // 0 selects the busy-spin (no sleep overshoot); >0 sleeps that many us between polls.
+    event_driven_poll_us = static_cast<unsigned>(std::max(0L, std::strtol(env, nullptr, 10)));
   }
   event_driven_max_us = slot_duration_us;
   if (const char* env = std::getenv("OCUDU_LPHY_EVENT_DRIVEN_MAX_US")) {
@@ -233,7 +245,15 @@ downlink_processor_baseband_impl::process(baseband_gateway_timestamp timestamp)
             break; // idle DL slot: no request within the grace window.
           }
         }
-        std::this_thread::sleep_for(std::chrono::microseconds(event_driven_poll_us));
+        // poll=0 -> tight busy-spin (deterministic, no sleep overshoot; re-checks steady_clock each iteration so the
+        // deadline is honored to sub-us). Nonzero -> sleep between polls (lower CPU, but sleep_for can overshoot).
+        if (event_driven_poll_us == 0) {
+          for (unsigned k = 0; k < 256; ++k) {
+            ed_cpu_relax();
+          }
+        } else {
+          std::this_thread::sleep_for(std::chrono::microseconds(event_driven_poll_us));
+        }
         pdxch_baseband_result = pdxch_proc_baseband.process_slot({.slot = sp, .sector = sector_id});
       }
       // Accounting: idle_stops = stopped at grace with no request (bounded idle burn); timeouts = request seen but
