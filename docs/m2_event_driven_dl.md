@@ -178,3 +178,32 @@ gNB should reach ~2 ms cleanly — the gNB side is no longer the bottleneck; the
 | `OCUDU_DL_PIPELINE_STATS` | report period (s) for M-offset + busy-wait stats | off |
 
 `scripts/m2sdr/guardian_hw.sh` passes these through via its `EXTRA_ENV` variable.
+
+## Future work: adaptive H (and levers already ruled out)
+
+Two tempting ways to drop H further were **measured out**, so don't rebuild them:
+- **Fast empty-slot signal — pointless.** An empty DL slot carries no data, so its latency
+  is irrelevant, and its busy-wait is absorbed by the throttle (grace << slot) with late
+  zeros harmlessly trimmed. Proof: H=1 had 0 gate-late at *idle*; gate-late appeared only
+  under real-traffic load.
+- **Per-core pinning — no effect.** Pinning tx/upper-PHY/rx to dedicated isolated cores
+  (via taskset, live) left the idle M-offset identical to floating (p50 70 / p99 120 /
+  max ~150 us). The ~120-209 us tail is inherent per-slot *compute* variance (full-grid
+  OFDM IFFT + FAPI + scheduler jitter), not contention (upper-PHY thread only 37% CPU
+  under load). Dropping it needs real compute acceleration (SIMD LDPC/IFFT) or a faster
+  CPU - no cheap win.
+
+**Two-regime finding:** the clean knee H~=1.4 is set by the **attach storm** (RACH -> RAR ->
+Msg4 -> RRC bursts = heavy back-to-back real slots). **Steady** small-packet URLLC is far
+more forgiving: measured 0 RF-fail over 60 s at H=1 (vs 5 during the storm), with the worst
+real-slot compute (~209 us) right at the min TX lead (~199 us) - i.e. H=1 is the edge,
+H~1.1-1.2 is clean-with-margin, DL ~2.5 ms.
+
+**FUTURE: adaptive H.** H (`radio_heads_prep_time`) is launch-time today, so one value must
+survive the attach storm -> practical floor ~1.4. Make it **dynamic**: run a safe H (~1.4)
+during attach, then drop to ~1.1 once the UE is in steady RRC-connected URLLC, exploiting
+the two-regime headroom to reach ~2.5 ms steady while still surviving attach. Needs a
+lower-PHY hook to retune `rx_to_tx_max_delay` at runtime (it is computed once in
+`lower_phy_factory.cpp`), driven by a connected / active-traffic signal from upper layers.
+Worth trying later; the gNB-side DL is otherwise optimized for this hardware (~4.6 -> ~2.8 ms
+clean), with the remainder being per-slot compute tail + the ~1.5 ms UE modem floor.
