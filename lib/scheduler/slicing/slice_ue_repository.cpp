@@ -3,6 +3,7 @@
 // Portions of this file may implement 3GPP specifications, which may be subject to additional licensing requirements.
 
 #include "slice_ue_repository.h"
+#include <cstdlib>
 
 using namespace ocudu;
 
@@ -101,6 +102,10 @@ static units::bytes sum_allocated_ul_harq_bytes(const ue& u)
 unsigned slice_ue::pending_ul_newtx_bytes() const
 {
   static constexpr unsigned SR_GRANT_BYTES = 512;
+  // UL-poll experiment (OCUDU_SCHED_UL_POLL): keep a standing UL grant on the UE every UL slot even with no pending
+  // SR/data, so a new UL packet rides the next grant immediately - eliminating the SR and BSR round-trip latency
+  // (there is no UL configured-grant in this tree). Read once; unset => stock behavior.
+  static const bool ul_poll = std::getenv("OCUDU_SCHED_UL_POLL") != nullptr;
 
   int pending_bytes  = u.logical_channels().ul_pending_bytes(slice_id);
   int harqs_in_bytes = -1;
@@ -114,9 +119,9 @@ unsigned slice_ue::pending_ul_newtx_bytes() const
     }
   }
 
-  // In case a SR is pending and this is the SRB slice, we return a minimum SR grant size if no other bearers have
-  // pending data.
-  if (slice_id == SRB_RAN_SLICE_ID and has_pending_sr()) {
+  // In case a SR is pending (or the UL-poll experiment is on) and this is the SRB slice, return a minimum grant size
+  // if no other bearers have pending data. A grant on the SRB slice serves the UE's UL data too (LCP fills it).
+  if (slice_id == SRB_RAN_SLICE_ID and (has_pending_sr() or ul_poll)) {
     pending_bytes = u.logical_channels().ul_pending_bytes();
     if (harqs_in_bytes < 0) {
       // In case harq_in_bytes has not been computed earlier.
