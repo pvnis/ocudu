@@ -193,17 +193,28 @@ Two tempting ways to drop H further were **measured out**, so don't rebuild them
   under load). Dropping it needs real compute acceleration (SIMD LDPC/IFFT) or a faster
   CPU - no cheap win.
 
-**Two-regime finding:** the clean knee H~=1.4 is set by the **attach storm** (RACH -> RAR ->
-Msg4 -> RRC bursts = heavy back-to-back real slots). **Steady** small-packet URLLC is far
-more forgiving: measured 0 RF-fail over 60 s at H=1 (vs 5 during the storm), with the worst
-real-slot compute (~209 us) right at the min TX lead (~199 us) - i.e. H=1 is the edge,
-H~1.1-1.2 is clean-with-margin, DL ~2.5 ms.
+**The knee is set by DL *load*, not "attach".** The limiter is the worst-case **per-slot
+compute** (LDPC encode, which scales with transport-block size, + the fixed OFDM IFFT/FAPI),
+which grows with **grid occupancy / MCS x PRBs per slot**. So the relevant axis is *bytes per
+slot*, not packets/sec:
+- URLLC = small TBs = light per-slot compute -> low H fine even at a high packet rate
+  (measured 0 RF-fail over 60 s at H=1, with worst real-slot compute ~209 us right at the
+  ~199 us min lead -> H=1 is the edge, H~1.1-1.2 clean-with-margin, DL ~2.5 ms);
+- eMBB / heavy throughput, and the attach signaling burst (larger RRC/NAS messages, back-to-
+  back, retransmitting on a weak link) = big TBs = heavy compute -> needs more H (the H=1.4
+  knee was measured during attach = a high-load transient, which gave 5 RF-fail at H=1).
+
+The failure mode is **per-slot-tail-vs-lead** (an individual heavy slot's ~220 us compute
+occasionally exceeds a small lead), NOT thread saturation - the upper-PHY thread was only
+37% busy even under a 656 Mbps blast, and under load both the mean (~44 -> ~92 us) and the
+tail (~140 -> ~189 us) grow.
 
 **FUTURE: adaptive H.** H (`radio_heads_prep_time`) is launch-time today, so one value must
-survive the attach storm -> practical floor ~1.4. Make it **dynamic**: run a safe H (~1.4)
-during attach, then drop to ~1.1 once the UE is in steady RRC-connected URLLC, exploiting
-the two-regime headroom to reach ~2.5 ms steady while still surviving attach. Needs a
-lower-PHY hook to retune `rx_to_tx_max_delay` at runtime (it is computed once in
-`lower_phy_factory.cpp`), driven by a connected / active-traffic signal from upper layers.
-Worth trying later; the gNB-side DL is otherwise optimized for this hardware (~4.6 -> ~2.8 ms
-clean), with the remainder being per-slot compute tail + the ~1.5 ms UE modem floor.
+cover the peak per-slot load -> practical floor ~1.4. Make it **dynamic, keyed on the
+scheduled per-slot TB size / grid occupancy** (which the MAC already knows) rather than on
+attach state: raise H when occupancy is high (eMBB bursts, attach), drop to ~1.0-1.2 when
+slots are light (sparse URLLC) -> ~2.5 ms steady while still surviving heavy load. Needs a
+lower-PHY hook to retune `rx_to_tx_max_delay` at runtime (computed once in
+`lower_phy_factory.cpp`), driven by an occupancy signal from the scheduler. Worth trying
+later; the gNB-side DL is otherwise optimized for this hardware (~4.6 -> ~2.8 ms clean), the
+remainder being per-slot compute tail + the ~1.5 ms UE modem floor.
